@@ -196,7 +196,7 @@ Vitest covers parser ranges/round trips, tree move helpers, real-SQLite move/res
 
 ## Deeper documentation
 
-See the [documentation index](docs/README.md) for detailed architecture, data contract, and database references.
+See the [documentation index](docs/README.md) for detailed architecture, interaction and undo semantics, data contracts, and database references.
 
 ## License
 

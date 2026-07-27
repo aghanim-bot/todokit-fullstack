@@ -52,6 +52,8 @@ flowchart LR
 
 Todokit is pinned to commit `0a017944d35e33b8e8c60576ef7d42f8f39a9d5f` and supplies presentation components, not persistence or application state. The application filters perspectives and tags in memory. A matching descendant keeps its ancestor chain visible. One global promise chain serializes every mutation. After each successful mutation the client records a closure for its exact API inverse, refreshes the server tree, and exposes the latest action through Undo and Ctrl/Cmd+Z. Text controls retain native undo. A failed forward mutation clears potentially stale history and refreshes; a failed inverse remains on the stack for retry.
 
+The exact focus/selection boundary, editor and draft lifecycles, filtered-tree indentation rules, mutation serialization, and inverse table are documented in [Interaction model](interaction-model.md).
+
 `src/client/api.ts` defines `taskApi`. Its shared request function uses same-origin `fetch`, sends JSON, unwraps successful `{ "data": ... }` responses, and converts error envelopes into `ApiClientError`. The client does not call the single-task `GET` route because it keeps the complete tree locally.
 
 The shared inbox parser also runs in the browser to preview metadata and derive safe, non-overlapping highlight ranges. Existing tasks are serialized deterministically to editable raw text. The server parses raw create/edit submissions again and is authoritative.
