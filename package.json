@@ -24,7 +24,7 @@
     "chrono-node": "^2.8.0",
     "fastify": "^5.4.0",
     "rrule": "^2.8.1",
-    "todokit": "git+https://github.com/aghanim-bot/todokit.git#5a8944dfc777b2576142b37bd029b516d3d890e8",
+    "todokit": "github:aghanim-bot/todokit#0a017944d35e33b8e8c60576ef7d42f8f39a9d5f",
     "zod": "^4.0.10"
   },
   "devDependencies": {

@@ -65,6 +65,96 @@ body,
   color: #df9a78;
 }
 
+.app-commands {
+  min-height: 34px;
+  padding: 5px 18px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--tk-line);
+  background: #15161b;
+  color: #74727c;
+  font-size: 10px;
+}
+
+.app-commands > button {
+  min-width: 64px;
+  padding: 4px 9px;
+  border: 1px solid #454258;
+  border-radius: 4px;
+  background: #252432;
+  color: #c2bee1;
+}
+
+.app-commands > button:disabled {
+  border-color: #2d2e35;
+  background: #1a1b20;
+  color: #5d5c65;
+  cursor: default;
+}
+
+.app-commands [role="status"] {
+  min-width: 0;
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-commands details {
+  position: relative;
+  flex: none;
+}
+
+.app-commands summary {
+  color: #9692c8;
+  cursor: pointer;
+}
+
+.app-commands details span {
+  position: absolute;
+  z-index: 12;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(420px, calc(100vw - 90px));
+  padding: 10px 12px;
+  border: 1px solid #3b3a46;
+  border-radius: 6px;
+  background: #22232a;
+  box-shadow: 0 8px 24px #0008;
+  color: #c4c1ca;
+  line-height: 1.55;
+}
+
+.app-inline-editor {
+  width: 100%;
+}
+
+.app-inline-editor .tk-highlighted-input__surface {
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px #565384;
+}
+
+.app-inline-editor .tk-highlighted-input__description {
+  overflow: hidden;
+  margin-top: 3px;
+  color: #898692;
+  font-size: 8px;
+  line-height: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-shell .tk-task-row:has(.app-inline-editor) {
+  min-height: 48px;
+}
+
+.app-shell .tk-task-row:has(.app-inline-editor) .tk-task-copy > small,
+.app-shell .tk-task-row:has(.app-inline-editor) > time,
+.app-shell .tk-task-row:has(.app-inline-editor) > .tk-row-add {
+  visibility: hidden;
+}
+
 .app-inspector {
   min-width: 0;
   overflow: auto;
@@ -148,6 +238,14 @@ body,
 }
 
 @media (max-width: 480px) {
+  .app-commands {
+    padding-inline: 10px;
+  }
+
+  .app-commands [role="status"] {
+    display: none;
+  }
+
   .app-shell .tk-task-row {
     grid-template-columns: 17px 20px minmax(90px, 1fr) 54px 22px;
   }

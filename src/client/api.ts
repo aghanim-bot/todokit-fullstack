@@ -1,5 +1,10 @@
 import type { ApiErrorBody, Task } from "../shared/types";
 
+export interface DeletedTaskResult {
+  deleted: number;
+  subtree: Task;
+}
+
 export class ApiClientError extends Error {
   constructor(
     message: string,
@@ -42,7 +47,15 @@ export const taskApi = {
     method: "POST",
     body: JSON.stringify({ completed })
   }),
-  delete: (id: string) => request<{ deleted: number }>(`/api/tasks/${id}`, {
+  move: (id: string, parentId: string | null, position: number) => request<Task>(`/api/tasks/${id}/move`, {
+    method: "POST",
+    body: JSON.stringify({ parentId, position })
+  }),
+  restore: (subtree: Task) => request<Task>("/api/tasks/restore", {
+    method: "POST",
+    body: JSON.stringify({ subtree })
+  }),
+  delete: (id: string) => request<DeletedTaskResult>(`/api/tasks/${id}`, {
     method: "DELETE"
   })
 };

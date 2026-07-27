@@ -8,7 +8,15 @@ import { normalizeRecurrence, parseInboxInput } from "../shared/parser.js";
 import type { ApiErrorBody } from "../shared/types.js";
 import { AppError } from "./errors.js";
 import { TaskRepository, type CreateTaskInput, type UpdateTaskInput } from "./task-repository.js";
-import { completionSchema, createTaskSchema, idParamsSchema, resolvedCreateTaskSchema, updateTaskSchema } from "./validation.js";
+import {
+  completionSchema,
+  createTaskSchema,
+  idParamsSchema,
+  moveTaskSchema,
+  resolvedCreateTaskSchema,
+  restoreSubtreeSchema,
+  updateTaskSchema
+} from "./validation.js";
 
 export interface AppOptions {
   logger?: boolean;
@@ -41,6 +49,11 @@ export async function createApp(db: Database.Database, options: AppOptions = {})
   });
 
   app.get("/api/tasks", async () => ({ data: repository.listTree() }));
+
+  app.post("/api/tasks/restore", async (request, reply) => {
+    const { subtree } = restoreSubtreeSchema.parse(request.body);
+    return reply.code(201).send({ data: repository.restoreSubtree(subtree) });
+  });
 
   app.get("/api/tasks/:id", async request => {
     const { id } = idParamsSchema.parse(request.params);
@@ -89,7 +102,27 @@ export async function createApp(db: Database.Database, options: AppOptions = {})
 
   app.patch("/api/tasks/:id", async request => {
     const { id } = idParamsSchema.parse(request.params);
-    const patch = updateTaskSchema.parse(request.body) as UpdateTaskInput;
+    const body = updateTaskSchema.parse(request.body);
+    let patch: UpdateTaskInput;
+    if (body.rawText) {
+      const parsed = parseInboxInput(body.rawText);
+      if (parsed.warnings.length) {
+        throw new AppError(422, "PARSE_ERROR", "Task text contains an invalid date or recurrence", {
+          warnings: parsed.warnings
+        });
+      }
+      if (!parsed.title) {
+        throw new AppError(422, "PARSE_ERROR", "Task text must include a task title");
+      }
+      patch = {
+        title: parsed.title,
+        dueAt: parsed.dueAt,
+        recurrence: parsed.recurrence,
+        tags: parsed.tags
+      };
+    } else {
+      patch = body as UpdateTaskInput;
+    }
     if (patch.recurrence) {
       try {
         patch.recurrence = normalizeRecurrence(patch.recurrence);
@@ -106,9 +139,15 @@ export async function createApp(db: Database.Database, options: AppOptions = {})
     return { data: repository.setCompleted(id, completed) };
   });
 
+  app.post("/api/tasks/:id/move", async request => {
+    const { id } = idParamsSchema.parse(request.params);
+    const move = moveTaskSchema.parse(request.body);
+    return { data: repository.move(id, move) };
+  });
+
   app.delete("/api/tasks/:id", async request => {
     const { id } = idParamsSchema.parse(request.params);
-    return { data: { deleted: repository.deleteSubtree(id) } };
+    return { data: repository.deleteSubtree(id) };
   });
 
   app.setErrorHandler((error, _request, reply) => {

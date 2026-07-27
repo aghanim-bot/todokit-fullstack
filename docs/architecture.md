@@ -45,16 +45,16 @@ flowchart LR
 `src/client/main.tsx` mounts `App` under React `StrictMode` and imports both Todokit's packaged stylesheet and the application stylesheet. `src/client/App.tsx` owns all state and supplies controlled values and callbacks to the Todokit dependency:
 
 - `TodoKitLayout` composes the rail, tag navigator, main outline, and inspector.
-- `QuickEntry` receives `quickText`; submission calls `taskApi.create({ rawText })`.
-- `TaskOutline` receives a recursively derived `TaskViewModel[]`. Selection, expansion, completion, and subtask creation are handled by `App`.
+- `QuickEntry` receives `quickText` plus shared-parser highlight ranges; submission calls `taskApi.create({ rawText })`.
+- `TaskOutline` receives a recursively derived `TaskViewModel[]`. Todokit owns accessible tree navigation; `App` owns selection, expansion, inline `HighlightedInput` editing/drafts, completion, and Tab/Shift+Tab moves.
 - `TaskInspector` receives a derived `TaskInspectorViewModel`. Its changes become API patches.
 - `PerspectiveRail` and `ProjectNavigator` receive client-computed counts and filters.
 
-Todokit is a pinned Git dependency and supplies presentation components, not persistence or application state. The application filters perspectives and tags in memory. A matching descendant keeps its ancestor chain visible. Inspector edits are applied optimistically and serialized per task with a promise chain; failures display an error and reload the server tree. Creates, completion changes, and deletes wait for the request and then refresh the full tree.
+Todokit is pinned to commit `0a017944d35e33b8e8c60576ef7d42f8f39a9d5f` and supplies presentation components, not persistence or application state. The application filters perspectives and tags in memory. A matching descendant keeps its ancestor chain visible. One global promise chain serializes every mutation. After each successful mutation the client records a closure for its exact API inverse, refreshes the server tree, and exposes the latest action through Undo and Ctrl/Cmd+Z. Text controls retain native undo. A failed forward mutation clears potentially stale history and refreshes; a failed inverse remains on the stack for retry.
 
 `src/client/api.ts` defines `taskApi`. Its shared request function uses same-origin `fetch`, sends JSON, unwraps successful `{ "data": ... }` responses, and converts error envelopes into `ApiClientError`. The client does not call the single-task `GET` route because it keeps the complete tree locally.
 
-The shared inbox parser also runs in the browser to preview tags, due dates, recurrence, and warnings. The server parses again on submission and is authoritative.
+The shared inbox parser also runs in the browser to preview metadata and derive safe, non-overlapping highlight ranges. Existing tasks are serialized deterministically to editable raw text. The server parses raw create/edit submissions again and is authoritative.
 
 ## Data shapes and tree assembly
 
@@ -84,9 +84,11 @@ Fastify has a `64 * 1024` byte body limit. The routes are:
 | `GET` | `/api/tasks` | Returns the complete task tree. |
 | `GET` | `/api/tasks/:id` | Validates a UUID and returns the task subtree. |
 | `POST` | `/api/tasks` | Validates raw or explicit input, parses inbox text when present, canonicalizes recurrence, creates a task, and returns `201`. |
-| `PATCH` | `/api/tasks/:id` | Validates a nonempty patch, canonicalizes recurrence when non-null, and updates details, state, tags, or parent. |
+| `POST` | `/api/tasks/restore` | Validates and transactionally restores one recursive subtree snapshot; returns `201`. |
+| `PATCH` | `/api/tasks/:id` | Validates a nonempty structured patch or an exclusive `rawText` edit; raw text replaces title/due/recurrence/tags together. |
 | `POST` | `/api/tasks/:id/completion` | Accepts exactly `{ "completed": boolean }` and delegates to the repository update path. |
-| `DELETE` | `/api/tasks/:id` | Deletes the selected task and descendants transactionally and returns the deleted row count. |
+| `POST` | `/api/tasks/:id/move` | Moves to an exact parent/position while reindexing both sibling lists transactionally. |
+| `DELETE` | `/api/tasks/:id` | Snapshots and deletes the subtree transactionally and returns both count and snapshot. |
 
 Zod validates route parameters and request bodies at runtime. Raw inbox creates pass through `parseInboxInput`; parser warnings become `422 PARSE_ERROR`. Non-null recurrence values pass through `normalizeRecurrence`; invalid rules become `422 VALIDATION_ERROR`. The repository validates parent existence and rejects cyclic moves.
 
@@ -104,11 +106,12 @@ Unknown `/api/...` paths and an unmatched request whose URL is exactly `/health`
 
 `src/shared/parser.ts` is deterministic for a supplied reference `Date`. The server calls it without an explicit reference, so it uses the server's current time; parsing passes UTC (`timezone: 0`) to `chrono-node`. It:
 
-1. recognizes one supported natural recurrence outside quoted text;
+1. recognizes supported natural or canonical recurrence syntax outside quoted text;
 2. extracts, lowercases, and de-duplicates supported `#tags`;
 3. recognizes a deliberately constrained date phrase;
 4. removes recognized metadata spans and returns the remaining title;
-5. reports `INVALID_DATE` or `INVALID_RECURRENCE` warnings rather than removing invalid text.
+5. reports `INVALID_DATE` or `INVALID_RECURRENCE` warnings without removing invalid text;
+6. derives an ordered full-source range partition for title/date/recurrence/tag/warning highlighting.
 
 Date-only results stay `YYYY-MM-DD`; results with a time become UTC ISO timestamps. Recurrence normalization accepts supported natural intervals or one RRULE, rejects multiline/`DTSTART` input, and returns one canonical line beginning `RRULE:`.
 
@@ -121,9 +124,9 @@ The recurrence value is only metadata. Completing a recurring task does not crea
 - recursive full-tree and subtree reads;
 - database-row to API-task mapping and in-process tree assembly;
 - UUID and UTC audit timestamp generation;
-- append-only sibling position allocation;
+- append allocation plus exact transactional sibling reindexing;
 - parent and cycle checks;
-- create, patch, completion, tag replacement, and subtree-delete transactions.
+- create, patch, completion, move, tag replacement, subtree snapshot/delete, and exact subtree-restore transactions.
 
 The current design is single-process synchronous SQLite access. A request doing database work blocks that Node.js process while the call runs. WAL and a five-second busy timeout improve file-level concurrency, but the application has no distributed locking or coordination for multiple server replicas.
 
@@ -159,6 +162,6 @@ Production is a single-container, single-process deployment. The multi-stage `Do
 - Database access is synchronous and designed around one server process.
 - There is no authentication, authorization, multi-user ownership, or tenant isolation.
 - Recurrence is parsed and stored but does not generate tasks.
-- Sibling order is stable, but the UI has no reordering control.
+- Keyboard indentation changes hierarchy and sibling order; drag-and-drop and arbitrary same-level reordering are not implemented.
 - The client reloads the entire tree after most mutations; there is no pagination or incremental sync.
 - Parsing supports a constrained English syntax and uses the server's UTC calendar.

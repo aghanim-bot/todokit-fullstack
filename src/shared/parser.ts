@@ -1,6 +1,6 @@
 import * as chrono from "chrono-node";
 import * as rruleModule from "rrule";
-import type { ParsedInboxInput } from "./types.js";
+import type { InboxHighlightRange, ParsedInboxInput } from "./types.js";
 
 const rruleExports = rruleModule as typeof rruleModule & { default?: typeof rruleModule };
 const RRule = rruleExports.RRule ?? rruleExports.default?.RRule;
@@ -8,6 +8,10 @@ const RRule = rruleExports.RRule ?? rruleExports.default?.RRule;
 interface Span {
   start: number;
   end: number;
+}
+
+interface SyntaxSpan extends Span {
+  kind: Exclude<InboxHighlightRange["kind"], "title">;
 }
 
 const weekdayRule = "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR";
@@ -33,7 +37,11 @@ const naturalRecurrences: Array<[RegExp, (match: RegExpMatchArray) => string]> =
 ];
 
 const naturalDatePattern = /\b(?:today|tomorrow|tonight|next\s+(?:sun(?:day)?|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|week)|in\s+\d+\s+(?:days?|weeks?)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s*\d{4})?)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/i;
-const dueDatePattern = /\bdue(?:\s+on|:)?\s+((?:\d{4}-\d{2}-\d{2}|today|tomorrow|tonight|next\s+(?:sun(?:day)?|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|week)|(?:sun(?:day)?|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?)|in\s+\d+\s+(?:days?|weeks?)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s*\d{4})?|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm))(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)/i;
+const dueDatePattern = /\bdue(?:\s+on|:)?\s+((?:\d{4}-\d{2}-\d{2}(?!T)|today|tomorrow|tonight|next\s+(?:sun(?:day)?|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|week)|(?:sun(?:day)?|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?)|in\s+\d+\s+(?:days?|weeks?)|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:,\s*\d{4})?|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm))(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)/i;
+const dueTimestampPattern = /\bdue(?:\s+on|:)?\s+(\d{4}-\d{2}-\d{2}T[^\s#]+)/gi;
+const canonicalRecurrencePattern = /\bRRULE:[A-Z0-9=,;+-]+\b/gi;
+const malformedRecurrencePattern = /\bevery\s+[^\s#]+(?:\s+[^\s#]+)?/gi;
+const malformedDuePattern = /\bdue(?:\s+on|:)?\s+\d{4}-\d{2}-\d{2}\b/gi;
 
 function outsideQuotes(source: string): string {
   let quote: "'" | "\"" | null = null;
@@ -63,6 +71,21 @@ function removeSpans(source: string, spans: Span[]): string {
     for (let index = start; index < end; index += 1) characters[index] = " ";
   }
   return characters.join("").replace(/\s+([,.;])/g, "$1").replace(/\s+/g, " ").trim();
+}
+
+function overlaps(left: Span, right: Span): boolean {
+  return left.start < right.end && right.start < left.end;
+}
+
+function addSpan(spans: SyntaxSpan[], span: SyntaxSpan): boolean {
+  if (span.start >= span.end || spans.some(existing => overlaps(existing, span))) return false;
+  spans.push(span);
+  return true;
+}
+
+function allMatches(source: string, pattern: RegExp): RegExpMatchArray[] {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  return [...source.matchAll(new RegExp(pattern.source, flags))];
 }
 
 function validIsoDate(value: string): boolean {
@@ -101,6 +124,149 @@ function findNaturalRecurrence(source: string): { recurrence: string | null; spa
   return { recurrence: null };
 }
 
+function unquoteTitle(title: string): string {
+  if (title.length < 2) return title;
+  const quote = title[0];
+  if ((quote !== "\"" && quote !== "'") || title.at(-1) !== quote) return title;
+  let escaped = false;
+  for (let index = 1; index < title.length - 1; index += 1) {
+    const character = title[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character === quote) return title;
+  }
+  return title.slice(1, -1).replace(/\\(["'\\])/g, "$1");
+}
+
+interface Analysis {
+  parsed: ParsedInboxInput;
+  syntaxSpans: SyntaxSpan[];
+}
+
+function analyzeInboxInput(input: string, now: Date): Analysis {
+  const searchable = outsideQuotes(input);
+  const syntaxSpans: SyntaxSpan[] = [];
+  const tags: string[] = [];
+  let recurrence: string | null = null;
+  let dueAt: string | null = null;
+  let invalidDate = false;
+  let invalidRecurrence = false;
+
+  for (const match of searchable.matchAll(canonicalRecurrencePattern)) {
+    if (match.index === undefined) continue;
+    const span = { start: match.index, end: match.index + match[0].length };
+    try {
+      const normalized = normalizeRecurrence(match[0]);
+      if (addSpan(syntaxSpans, { ...span, kind: "recurrence" }) && recurrence === null) {
+        recurrence = normalized;
+      }
+    } catch {
+      addSpan(syntaxSpans, { ...span, kind: "warning" });
+      invalidRecurrence = true;
+    }
+  }
+
+  for (const [pattern, createRule] of naturalRecurrences) {
+    for (const match of allMatches(searchable, pattern)) {
+      if (match.index === undefined) continue;
+      const span = { start: match.index, end: match.index + match[0].length, kind: "recurrence" as const };
+      if (addSpan(syntaxSpans, span) && recurrence === null) recurrence = createRule(match);
+    }
+  }
+
+  for (const match of searchable.matchAll(malformedRecurrencePattern)) {
+    if (match.index === undefined) continue;
+    const span = { start: match.index, end: match.index + match[0].length };
+    if (addSpan(syntaxSpans, { ...span, kind: "warning" })) invalidRecurrence = true;
+  }
+
+  const tagPattern = /(^|\s)#([\p{L}\p{N}_-]+)/gu;
+  for (const match of searchable.matchAll(tagPattern)) {
+    const prefixLength = match[1]?.length ?? 0;
+    const start = (match.index ?? 0) + prefixLength;
+    addSpan(syntaxSpans, {
+      start,
+      end: start + (match[0].length - prefixLength),
+      kind: "tag"
+    });
+    const tag = match[2]?.toLocaleLowerCase("en-US");
+    if (tag && !tags.includes(tag)) tags.push(tag);
+  }
+
+  for (const match of searchable.matchAll(dueTimestampPattern)) {
+    if (match.index === undefined || !match[1]) continue;
+    const span = { start: match.index, end: match.index + match[0].length };
+    const instant = new Date(match[1]);
+    const canonical = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(match[1])
+      && !Number.isNaN(instant.valueOf())
+      && instant.toISOString() === match[1];
+    if (!canonical) {
+      if (addSpan(syntaxSpans, { ...span, kind: "warning" })) invalidDate = true;
+    } else if (addSpan(syntaxSpans, { ...span, kind: "date" }) && dueAt === null) {
+      dueAt = match[1];
+    }
+  }
+
+  for (const match of allMatches(searchable, dueDatePattern)) {
+    if (match.index === undefined || !match[1]) continue;
+    const span = { start: match.index, end: match.index + match[0].length };
+    const isoDate = /^\d{4}-\d{2}-\d{2}/.test(match[1]) ? match[1].slice(0, 10) : null;
+    if (isoDate && !validIsoDate(isoDate)) {
+      if (addSpan(syntaxSpans, { ...span, kind: "warning" })) invalidDate = true;
+      continue;
+    }
+    const parsed = chrono.casual.parse(match[1], { instant: now, timezone: 0 }, { forwardDate: true })[0];
+    if (!parsed) {
+      if (addSpan(syntaxSpans, { ...span, kind: "warning" })) invalidDate = true;
+      continue;
+    }
+    if (addSpan(syntaxSpans, { ...span, kind: "date" }) && dueAt === null) {
+      dueAt = canonicalDue(parsed);
+    }
+  }
+
+  for (const match of searchable.matchAll(malformedDuePattern)) {
+    if (match.index === undefined) continue;
+    const span = { start: match.index, end: match.index + match[0].length };
+    if (addSpan(syntaxSpans, { ...span, kind: "warning" })) invalidDate = true;
+  }
+
+  for (const match of allMatches(searchable, naturalDatePattern)) {
+    if (match.index === undefined) continue;
+    const span = { start: match.index, end: match.index + match[0].length };
+    const parsed = chrono.casual.parse(match[0], { instant: now, timezone: 0 }, { forwardDate: true })[0];
+    if (!parsed) continue;
+    if (addSpan(syntaxSpans, { ...span, kind: "date" }) && dueAt === null) {
+      dueAt = canonicalDue(parsed);
+    }
+  }
+
+  syntaxSpans.sort((left, right) => left.start - right.start || left.end - right.end);
+  const cleanTitle = unquoteTitle(removeSpans(
+    input,
+    syntaxSpans.filter(span => span.kind !== "warning")
+  ));
+  return {
+    parsed: {
+      title: cleanTitle,
+      dueAt,
+      recurrence,
+      tags,
+      warnings: [
+        ...(invalidDate ? ["INVALID_DATE"] : []),
+        ...(invalidRecurrence ? ["INVALID_RECURRENCE"] : [])
+      ]
+    },
+    syntaxSpans
+  };
+}
+
 export function normalizeRecurrence(value: string): string {
   const trimmed = value.trim();
   const natural = findNaturalRecurrence(trimmed);
@@ -122,61 +288,57 @@ export function normalizeRecurrence(value: string): string {
 }
 
 export function parseInboxInput(input: string, now = new Date()): ParsedInboxInput {
-  let title = input.trim();
-  let invalidDate = false;
+  return analyzeInboxInput(input, now).parsed;
+}
 
-  const recurrenceResult = findNaturalRecurrence(title);
-  const hasInvalidRecurrence = /\bevery\s+\S+/i.test(outsideQuotes(title))
-    && !recurrenceResult.recurrence;
-  if (recurrenceResult.span) title = removeSpans(title, [recurrenceResult.span]);
-
-  const tagSearch = outsideQuotes(title);
-  const tagPattern = /(^|\s)#([\p{L}\p{N}_-]+)/gu;
-  const tagSpans: Span[] = [];
-  const tags: string[] = [];
-  for (const match of tagSearch.matchAll(tagPattern)) {
-    const prefixLength = match[1]?.length ?? 0;
-    const start = (match.index ?? 0) + prefixLength;
-    tagSpans.push({ start, end: start + (match[0].length - prefixLength) });
-    const tag = match[2]?.toLocaleLowerCase("en-US");
-    if (tag && !tags.includes(tag)) tags.push(tag);
+export function inboxHighlightRanges(input: string, now = new Date()): InboxHighlightRange[] {
+  const syntaxSpans = analyzeInboxInput(input, now).syntaxSpans;
+  const ranges: InboxHighlightRange[] = [];
+  let cursor = 0;
+  for (const span of syntaxSpans) {
+    if (span.start > cursor) ranges.push({ start: cursor, end: span.start, kind: "title" });
+    ranges.push(span);
+    cursor = span.end;
   }
-  title = removeSpans(title, tagSpans);
+  if (cursor < input.length) ranges.push({ start: cursor, end: input.length, kind: "title" });
+  return ranges;
+}
 
-  let dueAt: string | null = null;
-  const searchable = outsideQuotes(title);
-  const explicit = searchable.match(dueDatePattern);
-  let dateSpan: Span | undefined;
-  let dateText: string | undefined;
-  if (explicit?.index !== undefined && explicit[1]) {
-    const isoDate = /^\d{4}-\d{2}-\d{2}/.test(explicit[1]) ? explicit[1].slice(0, 10) : null;
-    if (isoDate && !validIsoDate(isoDate)) {
-      invalidDate = true;
-    } else {
-      dateSpan = { start: explicit.index, end: explicit.index + explicit[0].length };
-      dateText = explicit[1];
-    }
-  } else {
-    const natural = searchable.match(naturalDatePattern);
-    if (natural?.index !== undefined) {
-      dateSpan = { start: natural.index, end: natural.index + natural[0].length };
-      dateText = natural[0];
-    }
-  }
+export interface EditableTaskSyntax {
+  title: string;
+  dueAt: string | null;
+  recurrence: string | null;
+  tags: string[];
+}
 
-  if (dateSpan && dateText) {
-    const parsed = chrono.casual.parse(dateText, { instant: now, timezone: 0 }, { forwardDate: true });
-    if (parsed[0]) {
-      dueAt = canonicalDue(parsed[0]);
-      title = removeSpans(title, [dateSpan]);
-    } else {
-      invalidDate = true;
-    }
-  }
+function formatDueAt(value: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return `due ${value}`;
+  const date = new Date(value);
+  if (date.getUTCSeconds() || date.getUTCMilliseconds()) return `due ${value}`;
+  const hours = date.getUTCHours();
+  const minutes = date.getUTCMinutes();
+  const suffix = hours >= 12 ? "pm" : "am";
+  const clockHours = hours % 12 || 12;
+  const minuteText = minutes ? `:${String(minutes).padStart(2, "0")}` : "";
+  return `due ${date.toISOString().slice(0, 10)} at ${clockHours}${minuteText}${suffix}`;
+}
 
-  const warnings = [
-    ...(invalidDate ? ["INVALID_DATE"] : []),
-    ...(hasInvalidRecurrence ? ["INVALID_RECURRENCE"] : [])
-  ];
-  return { title, dueAt, recurrence: recurrenceResult.recurrence, tags, warnings };
+function quoteTitleIfNeeded(title: string): string {
+  if (
+    !analyzeInboxInput(title, new Date(0)).syntaxSpans.length
+    && unquoteTitle(title) === title
+  ) return title;
+  return `"${title.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+export function taskToEditableRawText(task: EditableTaskSyntax): string {
+  return [
+    quoteTitleIfNeeded(task.title),
+    task.dueAt ? formatDueAt(task.dueAt) : "",
+    task.recurrence ?? "",
+    ...[...new Set(task.tags.map(tag => tag.replace(/^#/, "").toLocaleLowerCase("en-US")))]
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right))
+      .map(tag => `#${tag}`)
+  ].filter(Boolean).join(" ");
 }

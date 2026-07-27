@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent
+} from "react";
+import {
+  HighlightedInput,
   PerspectiveRail,
   ProjectNavigator,
   QuickEntry,
@@ -11,18 +19,46 @@ import {
   type TaskInspectorViewModel,
   type TaskViewModel
 } from "todokit";
-import { parseInboxInput } from "../shared/parser";
+import {
+  inboxHighlightRanges,
+  parseInboxInput,
+  taskToEditableRawText
+} from "../shared/parser";
 import type { Task } from "../shared/types";
 import { taskApi } from "./api";
+import { indentMove, outdentMove, type TreeMove } from "./tree";
 
 type Perspective = "inbox" | "forecast" | "flagged" | "completed";
 
+const DRAFT_ID = "__local-subtask-draft__";
 const perspectiveDefinitions: Array<{ id: Perspective; label: string; icon: string }> = [
   { id: "inbox", label: "Inbox", icon: "inbox" },
   { id: "forecast", label: "Upcoming", icon: "forecast" },
   { id: "flagged", label: "Flagged", icon: "flagged" },
   { id: "completed", label: "Completed", icon: "review" }
 ];
+
+interface ExistingEditor {
+  kind: "existing";
+  taskId: string;
+  originalRaw: string;
+  value: string;
+}
+
+interface DraftEditor {
+  kind: "draft";
+  parentId: string;
+  parentTitle: string;
+  value: string;
+}
+
+type ActiveEditor = ExistingEditor | DraftEditor;
+
+interface UndoEntry {
+  id: number;
+  label: string;
+  inverse: () => Promise<unknown>;
+}
 
 function flatten(tasks: Task[]): Task[] {
   return tasks.flatMap(task => [task, ...flatten(task.children)]);
@@ -58,7 +94,17 @@ function isOverdue(task: Task, today: string): boolean {
   return !task.completed && Boolean(task.dueAt) && datePart(task.dueAt) < today;
 }
 
-function taskView(task: Task, expanded: Set<string>, today: string): TaskViewModel {
+function taskView(task: Task, expanded: Set<string>, today: string, editor: ActiveEditor | null): TaskViewModel {
+  const children = task.children.map(child => taskView(child, expanded, today, editor));
+  if (editor?.kind === "draft" && editor.parentId === task.id) {
+    children.push({
+      id: DRAFT_ID,
+      title: "New subtask",
+      completed: false,
+      expanded: false,
+      children: []
+    });
+  }
   return {
     id: task.id,
     title: task.title,
@@ -69,7 +115,7 @@ function taskView(task: Task, expanded: Set<string>, today: string): TaskViewMod
     dueDate: datePart(task.dueAt),
     reviewDate: datePart(task.reviewAt),
     dueDateStatus: isOverdue(task, today) ? "overdue" : "default",
-    children: task.children.map(child => taskView(child, expanded, today))
+    children
   };
 }
 
@@ -95,6 +141,13 @@ function recurrenceLabel(rule: string | null): string {
     "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR": "every weekday"
   };
   return labels[rule] ?? rule;
+}
+
+function isTextEditingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  return Boolean(target.closest(
+    "input, textarea, select, [contenteditable]:not([contenteditable=false]), [role=textbox]"
+  ));
 }
 
 interface DetailsProps {
@@ -126,35 +179,271 @@ function Details({ task, onChange, onRecurrenceChange, onDelete, onClose }: Deta
 
 export function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const tasksRef = useRef<Task[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState("No actions to undo");
   const [quickText, setQuickText] = useState("");
   const [perspective, setPerspective] = useState<Perspective>("inbox");
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const saveChains = useRef(new Map<string, Promise<unknown>>());
+  const [editor, setEditor] = useState<ActiveEditor | null>(null);
+  const editorRef = useRef<HTMLInputElement | null>(null);
+  const [undoHistory, setUndoHistory] = useState<UndoEntry[]>([]);
+  const undoHistoryRef = useRef<UndoEntry[]>([]);
+  const nextUndoId = useRef(1);
+  const mutationChain = useRef<Promise<void>>(Promise.resolve());
+  const editorSavePending = useRef(false);
+  const quickSavePending = useRef(false);
+  const pendingMoves = useRef(new Set<string>());
+  const pendingCompletions = useRef(new Set<string>());
+  const pendingDeletes = useRef(new Set<string>());
+  const editorIdentity = editor
+    ? `${editor.kind}:${editor.kind === "existing" ? editor.taskId : editor.parentId}`
+    : "";
 
-  const refresh = useCallback(async () => {
-    try {
-      const next = await taskApi.list();
-      setTasks(next);
-      setExpanded(current => {
-        if (current.size) return current;
-        return new Set(flatten(next).map(task => task.id));
-      });
-      setSelectedId(current => current && findTask(next, current) ? current : null);
-      setError(null);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Unable to load tasks");
-    } finally {
-      setLoading(false);
-    }
+  const replaceTasks = useCallback((next: Task[]) => {
+    tasksRef.current = next;
+    setTasks(next);
   }, []);
 
+  const refresh = useCallback(async () => {
+    const next = await taskApi.list();
+    replaceTasks(next);
+    setExpanded(current => {
+      if (current.size) return current;
+      return new Set(flatten(next).map(task => task.id));
+    });
+    setSelectedId(current => current && findTask(next, current) ? current : null);
+    setEditor(current => {
+      if (!current) return null;
+      if (current.kind === "draft") {
+        const parent = findTask(next, current.parentId);
+        return parent ? { ...current, parentTitle: parent.title } : null;
+      }
+      const task = findTask(next, current.taskId);
+      if (!task) return null;
+      if (current.value !== current.originalRaw) return current;
+      const raw = taskToEditableRawText(task);
+      return { ...current, originalRaw: raw, value: raw };
+    });
+    setError(null);
+    return next;
+  }, [replaceTasks]);
+
   useEffect(() => {
-    void Promise.resolve().then(refresh);
+    void Promise.resolve()
+      .then(refresh)
+      .catch(cause => setError(cause instanceof Error ? cause.message : "Unable to load tasks"))
+      .finally(() => setLoading(false));
   }, [refresh]);
+
+  useEffect(() => {
+    if (!editorIdentity) return;
+    const frame = requestAnimationFrame(() => {
+      editorRef.current?.focus();
+      editorRef.current?.select();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [editorIdentity]);
+
+  const serialize = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const result = mutationChain.current.then(operation, operation);
+    mutationChain.current = result.then(() => undefined, () => undefined);
+    return result;
+  }, []);
+
+  const setHistory = useCallback((next: UndoEntry[]) => {
+    undoHistoryRef.current = next;
+    setUndoHistory(next);
+  }, []);
+
+  const pushUndo = useCallback((label: string, inverse: () => Promise<unknown>) => {
+    const next = [
+      ...undoHistoryRef.current,
+      { id: nextUndoId.current++, label, inverse }
+    ].slice(-100);
+    setHistory(next);
+  }, [setHistory]);
+
+  const performMutation = useCallback(<T,>(
+    label: string,
+    forward: () => Promise<T>,
+    inverseFor: (result: T) => () => Promise<unknown>
+  ): Promise<T | undefined> => serialize(async () => {
+    let result: T;
+    try {
+      result = await forward();
+    } catch (cause) {
+      setHistory([]);
+      setStatus("Undo history cleared after a failed change");
+      setError(cause instanceof Error ? cause.message : "Request failed");
+      try {
+        await refresh();
+      } catch {
+        // The original actionable error remains visible.
+      }
+      return undefined;
+    }
+    pushUndo(label, inverseFor(result));
+    setStatus(label);
+    try {
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Change saved, but refresh failed");
+    }
+    return result;
+  }), [pushUndo, refresh, serialize, setHistory]);
+
+  const undo = useCallback(() => {
+    void serialize(async () => {
+      const entry = undoHistoryRef.current.at(-1);
+      if (!entry) return;
+      try {
+        await entry.inverse();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Could not undo");
+        setStatus(`Could not undo ${entry.label.toLocaleLowerCase("en-US")}`);
+        try {
+          await refresh();
+        } catch {
+          // Preserve the failed entry so the exact inverse can be retried.
+        }
+        return;
+      }
+      setHistory(undoHistoryRef.current.filter(candidate => candidate.id !== entry.id));
+      setStatus(`Undid ${entry.label.toLocaleLowerCase("en-US")}`);
+      try {
+        await refresh();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Undo succeeded, but refresh failed");
+      }
+    });
+  }, [refresh, serialize, setHistory]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key.toLocaleLowerCase("en-US") !== "z"
+        || (!event.ctrlKey && !event.metaKey)
+        || event.altKey
+        || event.shiftKey
+        || event.repeat
+        || isTextEditingTarget(event.target)
+      ) return;
+      event.preventDefault();
+      undo();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [undo]);
+
+  const focusSelectedRow = useCallback(() => {
+    requestAnimationFrame(() => {
+      const row = document.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]');
+      row?.focus();
+    });
+  }, []);
+
+  const cancelEditor = useCallback((restoreFocus = true) => {
+    setEditor(null);
+    setStatus("Edit cancelled");
+    if (restoreFocus) focusSelectedRow();
+  }, [focusSelectedRow]);
+
+  const canReplaceEditor = useCallback(() => {
+    if (!editor) return true;
+    const unchanged = editor.kind === "existing" && editor.value === editor.originalRaw;
+    if (!editor.value.trim() || unchanged) return true;
+    setStatus("Save with Enter or cancel with Escape before switching tasks");
+    return false;
+  }, [editor]);
+
+  const openExistingEditor = useCallback((id: string) => {
+    if (editor?.kind === "existing" && editor.taskId === id) return;
+    if (!canReplaceEditor()) return;
+    const task = findTask(tasksRef.current, id);
+    if (!task) return;
+    const raw = taskToEditableRawText(task);
+    setSelectedId(id);
+    setEditor({ kind: "existing", taskId: id, originalRaw: raw, value: raw });
+    setStatus(`Editing ${task.title}`);
+  }, [canReplaceEditor, editor]);
+
+  const openDraftEditor = useCallback((parentId: string) => {
+    if (!canReplaceEditor()) return;
+    const parent = findTask(tasksRef.current, parentId);
+    if (!parent) return;
+    setSelectedId(parentId);
+    setExpanded(current => new Set(current).add(parentId));
+    setEditor({ kind: "draft", parentId, parentTitle: parent.title, value: "" });
+    setStatus(`New subtask for ${parent.title}`);
+  }, [canReplaceEditor]);
+
+  const commitEditor = useCallback(async (createNextDraft = false) => {
+    if (editorSavePending.current) return;
+    const current = editor;
+    if (!current) return;
+    const parsed = parseInboxInput(current.value);
+    if (!current.value.trim() || !parsed.title) {
+      cancelEditor();
+      return;
+    }
+    if (parsed.warnings.length) {
+      setStatus("Fix the highlighted date or recurrence before saving");
+      return;
+    }
+
+    editorSavePending.current = true;
+    try {
+      if (current.kind === "draft") {
+        const created = await performMutation(
+          "Created subtask",
+          () => taskApi.create({ rawText: current.value, parentId: current.parentId }),
+          task => () => taskApi.delete(task.id)
+        );
+        if (!created) return;
+        setEditor(null);
+        setSelectedId(created.id);
+        focusSelectedRow();
+        return;
+      }
+
+      const previous = findTask(tasksRef.current, current.taskId);
+      if (!previous) {
+        cancelEditor(false);
+        return;
+      }
+      const previousFields = {
+        title: previous.title,
+        dueAt: previous.dueAt,
+        recurrence: previous.recurrence,
+        tags: previous.tags
+      };
+      const updated = await performMutation(
+        "Edited task",
+        () => taskApi.update(current.taskId, { rawText: current.value }),
+        () => () => taskApi.update(current.taskId, previousFields)
+      );
+      if (!updated) return;
+      setSelectedId(current.taskId);
+      if (createNextDraft) {
+        setExpanded(value => new Set(value).add(current.taskId));
+        setEditor({
+          kind: "draft",
+          parentId: current.taskId,
+          parentTitle: updated.title,
+          value: ""
+        });
+      } else {
+        setEditor(null);
+        focusSelectedRow();
+      }
+    } finally {
+      editorSavePending.current = false;
+    }
+  }, [cancelEditor, editor, focusSelectedRow, performMutation]);
 
   const allTasks = useMemo(() => flatten(tasks), [tasks]);
   const selected = findTask(tasks, selectedId);
@@ -198,28 +487,21 @@ export function App() {
       color: ["#8580e8", "#6e9fe3", "#72b69b", "#c6a267"][index % 4]
     }));
 
-  const run = useCallback(async (operation: () => Promise<unknown>) => {
-    try {
-      await operation();
-      setError(null);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Request failed");
-      await refresh();
+  const patchTask = useCallback((id: string, patch: Record<string, unknown>, label: string) => {
+    const previous = findTask(tasksRef.current, id);
+    if (!previous) return;
+    const inversePatch: Record<string, unknown> = {};
+    for (const key of Object.keys(patch)) {
+      inversePatch[key] = previous[key as keyof Task];
     }
-  }, [refresh]);
-
-  const savePatch = useCallback((id: string, patch: Record<string, unknown>, optimistic: (task: Task) => Task) => {
-    setTasks(current => replaceTask(current, id, optimistic));
-    const previous = saveChains.current.get(id) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(() => taskApi.update(id, patch));
-    saveChains.current.set(id, next);
-    void next.then(() => setError(null)).catch(async cause => {
-      setError(cause instanceof Error ? cause.message : "Could not save task");
-      await refresh();
-    }).finally(() => {
-      if (saveChains.current.get(id) === next) saveChains.current.delete(id);
-    });
-  }, [refresh]);
+    const optimistic = replaceTask(tasksRef.current, id, task => ({ ...task, ...patch }));
+    replaceTasks(optimistic);
+    void performMutation(
+      label,
+      () => taskApi.update(id, patch),
+      () => () => taskApi.update(id, inversePatch)
+    );
+  }, [performMutation, replaceTasks]);
 
   const inspectorChange = (patch: Partial<TaskInspectorViewModel>) => {
     if (!selected) return;
@@ -231,23 +513,121 @@ export function App() {
     if (patch.reviewDate !== undefined) apiPatch.reviewAt = patch.reviewDate || null;
     if (patch.tags !== undefined) apiPatch.tags = patch.tags;
     if (patch.flagged !== undefined) apiPatch.flagged = patch.flagged;
-    savePatch(selected.id, apiPatch, task => ({
-      ...task,
-      ...(patch.title !== undefined ? { title: patch.title } : {}),
-      ...(patch.notes !== undefined ? { notes: patch.notes } : {}),
-      ...(patch.dueDate !== undefined ? { dueAt: patch.dueDate || null } : {}),
-      ...(patch.reviewDate !== undefined ? { reviewAt: patch.reviewDate || null } : {}),
-      ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
-      ...(patch.flagged !== undefined ? { flagged: patch.flagged } : {})
-    }));
+    patchTask(selected.id, apiPatch, "Edited task details");
   };
 
-  if (loading) return <main className="app-state" aria-live="polite"><span className="app-spinner"/><h1>Loading tasks</h1></main>;
+  const moveTask = useCallback((id: string, move: TreeMove | null, restoreRowFocus = true) => {
+    if (pendingMoves.current.has(id)) return;
+    const previous = findTask(tasksRef.current, id);
+    if (!previous || !move) {
+      setStatus("That outline move is not available");
+      return;
+    }
+    if (previous.parentId === move.parentId && previous.position === move.position) return;
+    let inverseMove = { parentId: previous.parentId, position: previous.position };
+    pendingMoves.current.add(id);
+    void performMutation(
+      move.parentId === previous.parentId || move.parentId ? "Indented task" : "Outdented task",
+      () => {
+        const current = findTask(tasksRef.current, id);
+        if (!current) throw new Error("Task is no longer available to move");
+        inverseMove = { parentId: current.parentId, position: current.position };
+        return taskApi.move(id, move.parentId, move.position);
+      },
+      () => () => taskApi.move(id, inverseMove.parentId, inverseMove.position)
+    ).then(result => {
+      if (!result) return;
+      if (move.parentId) setExpanded(current => new Set(current).add(move.parentId as string));
+      setSelectedId(id);
+      if (restoreRowFocus) focusSelectedRow();
+    }).finally(() => {
+      pendingMoves.current.delete(id);
+    });
+  }, [focusSelectedRow, performMutation]);
+
+  if (loading) {
+    return <main className="app-state" aria-live="polite"><span className="app-spinner"/><h1>Loading tasks</h1></main>;
+  }
 
   const viewTitle = activeTag
     ? `#${activeTag}`
     : perspectiveDefinitions.find(item => item.id === perspective)?.label ?? "Inbox";
   const parsedPreview = quickText ? parseInboxInput(quickText) : null;
+  const quickHighlights = inboxHighlightRanges(quickText);
+  const outlineViews = visibleTasks.map(task => taskView(task, expanded, today, editor));
+
+  const renderEditor = (viewTask: TaskViewModel) => {
+    if (viewTask.id === DRAFT_ID && editor?.kind === "draft") {
+      return <HighlightedInput
+        className="app-inline-editor"
+        ariaLabel={`New subtask for ${editor.parentTitle}`}
+        value={editor.value}
+        highlights={inboxHighlightRanges(editor.value)}
+        onValueChange={value => setEditor(current => current?.kind === "draft" ? { ...current, value } : current)}
+        inputRef={editorRef}
+        autoFocus
+        autoComplete="off"
+        placeholder="New subtask"
+        description="Enter saves · Escape cancels"
+        onBlur={() => {
+          if (!editor.value.trim()) cancelEditor();
+        }}
+        onKeyDown={event => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            cancelEditor();
+          } else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            event.stopPropagation();
+            void commitEditor();
+          }
+        }}
+      />;
+    }
+    if (editor?.kind === "existing" && editor.taskId === viewTask.id) {
+      return <HighlightedInput
+        className="app-inline-editor"
+        ariaLabel={`Edit ${viewTask.title}`}
+        value={editor.value}
+        highlights={inboxHighlightRanges(editor.value)}
+        onValueChange={value => setEditor(current => current?.kind === "existing" ? { ...current, value } : current)}
+        inputRef={editorRef}
+        autoFocus
+        autoComplete="off"
+        description="Enter saves · Shift+Enter saves and adds subtask · Escape cancels · Tab changes level"
+        onKeyDown={event => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            cancelEditor();
+          } else if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+            event.preventDefault();
+            event.stopPropagation();
+            void commitEditor(event.shiftKey);
+          }
+        }}
+      />;
+    }
+    return viewTask.title;
+  };
+
+  const handleTaskKeyDown = (viewTask: TaskViewModel, event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (viewTask.id === DRAFT_ID || event.key !== "Tab") return;
+    const target = event.target;
+    const fromRow = target === event.currentTarget;
+    const fromEditor = target instanceof Element && Boolean(target.closest(".app-inline-editor"));
+    if (!fromRow && !fromEditor) return;
+    event.preventDefault();
+    const move = event.shiftKey
+      ? outdentMove(visibleTasks, viewTask.id)
+      : indentMove(visibleTasks, viewTask.id);
+    if (move && !event.shiftKey) {
+      const fullParent = findTask(tasksRef.current, move.parentId);
+      move.position = fullParent?.children.length ?? move.position;
+    }
+    moveTask(viewTask.id, move, !fromEditor);
+  };
 
   return <TodoKitLayout
     className="app-shell"
@@ -255,6 +635,8 @@ export function App() {
       activeId={activeTag ? "" : perspective}
       items={railItems}
       onSelect={id => {
+        if (!canReplaceEditor()) return;
+        setEditor(null);
         setPerspective(id as Perspective);
         setActiveTag(null);
         setSelectedId(null);
@@ -265,6 +647,8 @@ export function App() {
       items={tagItems}
       activeId={activeTag}
       onSelect={tag => {
+        if (!canReplaceEditor()) return;
+        setEditor(null);
         setActiveTag(tag);
         setSelectedId(null);
       }}
@@ -274,13 +658,24 @@ export function App() {
       {error && <div className="app-error" role="alert"><span>{error}</span><button type="button" onClick={() => void refresh()}>Retry</button></div>}
       <QuickEntry
         value={quickText}
+        highlights={quickHighlights}
         onValueChange={setQuickText}
         onSubmit={rawText => {
-          if (!rawText.trim()) return;
-          void run(async () => {
-            await taskApi.create({ rawText });
-            setQuickText("");
-            await refresh();
+          if (!rawText.trim() || quickSavePending.current) return;
+          const parsed = parseInboxInput(rawText);
+          if (!parsed.title || parsed.warnings.length) {
+            setStatus("Fix the highlighted task syntax before saving");
+            return;
+          }
+          quickSavePending.current = true;
+          void performMutation(
+            "Created task",
+            () => taskApi.create({ rawText }),
+            task => () => taskApi.delete(task.id)
+          ).then(created => {
+            if (created) setQuickText("");
+          }).finally(() => {
+            quickSavePending.current = false;
           });
         }}
         placeholder={'Try “Submit report tomorrow at 5pm #work”'}
@@ -293,13 +688,30 @@ export function App() {
           </>
           : "#tags · tomorrow at 5pm · monthly · due 2026-08-01"}
       />
+      <div className="app-commands">
+        <button
+          type="button"
+          aria-label="Undo last action"
+          disabled={!undoHistory.length}
+          onClick={undo}
+        >Undo{undoHistory.at(-1) ? ` ${undoHistory.at(-1)?.label.toLocaleLowerCase("en-US")}` : ""}</button>
+        <span role="status" aria-live="polite">{status}</span>
+        <details>
+          <summary>Keyboard shortcuts</summary>
+          <span>↑/↓ navigate · ←/→ collapse or expand · Enter edit/save · Shift+Enter save + subtask · Tab/Shift+Tab indent/outdent · Escape cancel · Ctrl/Cmd+Z undo</span>
+        </details>
+      </div>
       <TaskOutline
-        tasks={visibleTasks.map(task => taskView(task, expanded, today))}
+        tasks={outlineViews}
         title={viewTitle}
         headerEyebrow={activeTag ? "Tag" : "Perspective"}
         headerSummary={`${flatten(visibleTasks).filter(task => !task.completed).length} remaining`}
         selectedTaskId={selectedId}
-        onSelect={setSelectedId}
+        renderTitle={renderEditor}
+        onTaskKeyDown={handleTaskKeyDown}
+        onSelect={id => {
+          if (id !== DRAFT_ID) openExistingEditor(id);
+        }}
         onToggleExpanded={id => setExpanded(current => {
           const next = new Set(current);
           if (next.has(id)) next.delete(id);
@@ -307,39 +719,56 @@ export function App() {
           return next;
         })}
         onToggleComplete={id => {
-          const task = findTask(tasks, id);
+          if (id === DRAFT_ID || pendingCompletions.current.has(id)) return;
+          const task = findTask(tasksRef.current, id);
           if (!task) return;
-          void run(async () => {
-            await taskApi.complete(id, !task.completed);
-            await refresh();
+          const completed = !task.completed;
+          replaceTasks(replaceTask(tasksRef.current, id, current => ({
+            ...current,
+            completed,
+            completedAt: completed ? current.completedAt : null
+          })));
+          pendingCompletions.current.add(id);
+          void performMutation(
+            task.completed ? "Reopened task" : "Completed task",
+            () => taskApi.complete(id, completed),
+            () => () => taskApi.complete(id, task.completed)
+          ).finally(() => {
+            pendingCompletions.current.delete(id);
           });
         }}
-        onAddSubtask={parentId => {
-          const rawText = window.prompt("Subtask title (dates, recurrence, and #tags are supported)");
-          if (!rawText?.trim()) return;
-          void run(async () => {
-            await taskApi.create({ rawText, parentId });
-            setExpanded(current => new Set(current).add(parentId));
-            await refresh();
-          });
+        onAddSubtask={id => {
+          if (id !== DRAFT_ID) openDraftEditor(id);
         }}
       />
     </>}
     inspector={<Details
-      key={selected?.id ?? "empty"}
+      key={`${selected?.id ?? "empty"}:${selected?.recurrence ?? ""}`}
       task={selected}
       onChange={inspectorChange}
-      onClose={() => setSelectedId(null)}
+      onClose={() => {
+        if (!canReplaceEditor()) return;
+        setEditor(null);
+        setSelectedId(null);
+      }}
       onRecurrenceChange={recurrence => {
         if (!selected || recurrenceLabel(selected.recurrence) === (recurrence ?? "")) return;
-        savePatch(selected.id, { recurrence }, task => ({ ...task, recurrence }));
+        patchTask(selected.id, { recurrence }, "Edited recurrence");
       }}
       onDelete={() => {
-        if (!selected || !window.confirm(`Delete “${selected.title}” and all of its subtasks?`)) return;
-        void run(async () => {
-          await taskApi.delete(selected.id);
+        if (!selected || pendingDeletes.current.has(selected.id)) return;
+        const id = selected.id;
+        pendingDeletes.current.add(id);
+        void performMutation(
+          "Deleted task",
+          () => taskApi.delete(id),
+          result => () => taskApi.restore(result.subtree)
+        ).then(result => {
+          if (!result) return;
+          setEditor(null);
           setSelectedId(null);
-          await refresh();
+        }).finally(() => {
+          pendingDeletes.current.delete(id);
         });
       }}
     />}

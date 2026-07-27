@@ -47,7 +47,7 @@ WITH RECURSIVE tree AS (
 SELECT * FROM tree ORDER BY sort_path;
 ```
 
-The same technique anchors a subtree at one ID for inspection. Subtree deletion first resolves all descendants in a recursive CTE and deletes them in one transaction. Reparenting resolves the proposed task's descendants recursively and rejects self-parenting or any descendant parent, preventing cycles before the foreign-key-safe update runs.
+The same technique anchors a subtree at one ID for inspection. Moves close the source sibling gap, open the exact destination position, and reject cycles in one transaction. Deletion snapshots the recursive subtree before removing it and compacting siblings; the validated restore endpoint inserts the same IDs, parents, positions, fields, timestamps, and tags transactionally for undo.
 
 ## Inbox syntax
 
@@ -73,6 +73,20 @@ Supported natural recurrence syntax is `daily`, `weekly`, `monthly`, `yearly`, `
 
 Tags begin with `#` at the start of a token and contain letters, numbers, underscores, or hyphens. They are case-normalized and de-duplicated. Hashes inside single or double quotes, embedded hashes such as `C#`, and email-like text are left alone. Invalid explicit dates or `every …` expressions are not silently removed: the API returns `422 PARSE_ERROR`, while the client preview warns before submission. This constrained recognition avoids treating ordinary words such as “May” or “Friday team” as accidental dates.
 
+Quick entry and inline row editors use Todokit's native-input highlighting backdrop. The shared parser supplies exact, non-overlapping `title`, `date`, `recurrence`, `tag`, and `warning` source ranges; rendering uses React text nodes rather than HTML injection.
+
+## Keyboard workflow
+
+- `Arrow Up` / `Arrow Down`, `Home` / `End`: move through visible tasks.
+- `Arrow Right` / `Arrow Left`: expand/collapse or move to a child/parent.
+- `Enter` or click a task title: select it and edit in place; `Enter` again saves.
+- `Shift+Enter`: save an existing task and open a new inline subtask draft.
+- `Escape`: cancel the current edit/draft and return focus to the selected row.
+- `Tab` / `Shift+Tab` on a focused row or its inline editor: indent under the previous visible sibling / outdent after the parent. Tab remains native in quick entry, inspector fields, and nested buttons.
+- `Ctrl+Z` / `Cmd+Z` outside text controls: undo the latest successful app mutation. Native text undo is preserved while typing.
+
+The row `+` action creates one unsaved inline draft; no prompt or modal is used. Empty drafts cancel on blur, and non-empty drafts require explicit Enter or Escape. The visible Undo/status strip and keyboard-help disclosure repeat these commands in the app.
+
 ## API
 
 All successful application responses wrap payloads in `{ "data": ... }`. Errors always use:
@@ -93,9 +107,11 @@ All successful application responses wrap payloads in `{ "data": ... }`. Errors 
 | `GET` | `/api/tasks` | Complete recursive task tree |
 | `GET` | `/api/tasks/:id` | Task and its recursive subtree |
 | `POST` | `/api/tasks` | Create root/subtask from `rawText` or explicit fields |
-| `PATCH` | `/api/tasks/:id` | Edit details, tags, state, or `parentId` |
+| `PATCH` | `/api/tasks/:id` | Edit structured fields or replace title/date/recurrence/tags from `{ "rawText": "..." }` |
 | `POST` | `/api/tasks/:id/completion` | Complete/uncomplete with `{ "completed": true }` |
-| `DELETE` | `/api/tasks/:id` | Transactionally delete a subtree |
+| `POST` | `/api/tasks/:id/move` | Move to exact `{ "parentId": null, "position": 0 }` with sibling reindexing |
+| `DELETE` | `/api/tasks/:id` | Delete and return `{ deleted, subtree }` for exact undo |
+| `POST` | `/api/tasks/restore` | Transactionally restore a validated recursive subtree snapshot |
 
 Unknown fields, malformed UUIDs, invalid dates/tags/recurrence, empty updates, missing parents, missing tasks, and cycles receive appropriate `400`, `404`, `409`, or `422` responses.
 
@@ -169,14 +185,14 @@ npm run build
 npm run check
 ```
 
-Vitest covers parser edge cases, fresh nested-path initialization, recursive order/depth, subtree deletion, cycles and missing parents, normalized tags, completion, API validation/error contracts, health, and key Todokit-driven frontend behavior.
+Vitest covers parser ranges/round trips, tree move helpers, real-SQLite move/restore rollback and ordering, every API inverse flow, and keyboard-first React interactions including inline drafts, focus, highlighting, and native/global undo discrimination.
 
 ## Limitations
 
 - There is no authentication or multi-user ownership; deploy it as a private single-user service unless an auth layer is added.
 - Recurrence is parsed, validated, stored, and editable, but this version does not automatically generate the next occurrence when a task is completed.
 - Natural-language parsing intentionally supports a documented English subset instead of guessing at every date-like phrase.
-- Sibling ordering is stable and maintained by the API, but the UI does not yet expose drag-and-drop reordering.
+- Sibling ordering is maintained through keyboard indent/outdent; drag-and-drop and arbitrary same-level reordering are not exposed.
 
 ## Deeper documentation
 

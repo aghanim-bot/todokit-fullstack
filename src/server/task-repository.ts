@@ -45,6 +45,16 @@ export interface UpdateTaskInput {
   tags?: string[];
 }
 
+export interface MoveTaskInput {
+  parentId: string | null;
+  position: number;
+}
+
+export interface DeletedSubtree {
+  deleted: number;
+  subtree: Task;
+}
+
 const selectColumns = `
   tree.id, tree.parent_id, tree.title, tree.notes, tree.due_at, tree.review_at, tree.recurrence,
   tree.completed, tree.completed_at, tree.flagged, tree.position,
@@ -184,19 +194,20 @@ export class TaskRepository {
 
   update(id: string, patch: UpdateTaskInput): Task {
     this.db.transaction(() => {
-      const current = this.getFlat(id);
-      const parentId = patch.parentId !== undefined ? patch.parentId : current.parent_id;
-      if (patch.parentId !== undefined && parentId !== current.parent_id) {
-        this.validateMove(id, parentId);
+      let current = this.getFlat(id);
+      if (patch.parentId !== undefined && patch.parentId !== current.parent_id) {
+        this.moveRows(id, {
+          parentId: patch.parentId,
+          position: this.siblingCount(patch.parentId)
+        });
+        current = this.getFlat(id);
       }
       const completed = patch.completed ?? Boolean(current.completed);
       const completedAt = completed
         ? (current.completed ? current.completed_at : new Date().toISOString())
         : null;
-      const position = parentId === current.parent_id ? current.position : this.nextPosition(parentId);
       this.db.prepare(`
         UPDATE tasks SET
-          parent_id = @parentId,
           title = @title,
           notes = @notes,
           due_at = @dueAt,
@@ -205,12 +216,10 @@ export class TaskRepository {
           completed = @completed,
           completed_at = @completedAt,
           flagged = @flagged,
-          position = @position,
           updated_at = @updatedAt
         WHERE id = @id
       `).run({
         id,
-        parentId,
         title: patch.title ?? current.title,
         notes: patch.notes ?? current.notes,
         dueAt: patch.dueAt !== undefined ? patch.dueAt : current.due_at,
@@ -219,7 +228,6 @@ export class TaskRepository {
         completed: completed ? 1 : 0,
         completedAt,
         flagged: (patch.flagged ?? Boolean(current.flagged)) ? 1 : 0,
-        position,
         updatedAt: new Date().toISOString()
       });
       if (patch.tags) this.replaceTags(id, patch.tags);
@@ -231,9 +239,17 @@ export class TaskRepository {
     return this.update(id, { completed });
   }
 
-  deleteSubtree(id: string): number {
+  move(id: string, input: MoveTaskInput): Task {
+    this.db.transaction(() => {
+      this.moveRows(id, input);
+    })();
+    return this.get(id);
+  }
+
+  deleteSubtree(id: string): DeletedSubtree {
     return this.db.transaction(() => {
-      this.getFlat(id);
+      const root = this.getFlat(id);
+      const subtree = this.get(id);
       const count = this.db.prepare(`
         WITH RECURSIVE subtree(id) AS (
           SELECT id FROM tasks WHERE id = ?
@@ -254,7 +270,65 @@ export class TaskRepository {
         )
         DELETE FROM tasks WHERE id IN (SELECT id FROM subtree)
       `).run(id);
-      return count.count;
+      this.closeSiblingGap(root.parent_id, root.position);
+      return { deleted: count.count, subtree };
+    })();
+  }
+
+  restoreSubtree(subtree: Task): Task {
+    return this.db.transaction(() => {
+      const nodes = flattenSubtree(subtree);
+      if (!nodes.length) throw new ConflictError("Subtree is empty");
+      this.validateParent(subtree.parentId);
+      if (subtree.position > this.siblingCount(subtree.parentId)) {
+        throw new ConflictError("Restore position is outside the sibling list");
+      }
+      const ids = new Set<string>();
+      for (const task of nodes) {
+        if (ids.has(task.id)) throw new ConflictError("Subtree contains duplicate task IDs");
+        ids.add(task.id);
+        if (this.db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(task.id)) {
+          throw new ConflictError(`Task ${task.id} already exists`);
+        }
+        if (task !== subtree && (!task.parentId || !ids.has(task.parentId))) {
+          throw new ConflictError("Subtree parent relationships are invalid");
+        }
+        task.children.forEach((child, position) => {
+          if (child.parentId !== task.id || child.position !== position) {
+            throw new ConflictError("Subtree sibling positions are invalid");
+          }
+        });
+      }
+
+      this.openSiblingGap(subtree.parentId, subtree.position);
+      const insert = this.db.prepare(`
+        INSERT INTO tasks (
+          id, parent_id, title, notes, due_at, review_at, recurrence, completed,
+          completed_at, flagged, position, created_at, updated_at
+        ) VALUES (
+          @id, @parentId, @title, @notes, @dueAt, @reviewAt, @recurrence, @completed,
+          @completedAt, @flagged, @position, @createdAt, @updatedAt
+        )
+      `);
+      for (const task of nodes) {
+        insert.run({
+          id: task.id,
+          parentId: task.parentId,
+          title: task.title,
+          notes: task.notes,
+          dueAt: task.dueAt,
+          reviewAt: task.reviewAt,
+          recurrence: task.recurrence,
+          completed: task.completed ? 1 : 0,
+          completedAt: task.completedAt,
+          flagged: task.flagged ? 1 : 0,
+          position: task.position,
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt
+        });
+        this.replaceTags(task.id, task.tags);
+      }
+      return this.get(subtree.id);
     })();
   }
 
@@ -286,6 +360,60 @@ export class TaskRepository {
     if (descendant) throw new ConflictError("A task cannot be moved beneath itself or its descendants");
   }
 
+  private moveRows(id: string, input: MoveTaskInput): void {
+    const current = this.getFlat(id);
+    this.validateMove(id, input.parentId);
+    const targetCount = this.siblingCount(input.parentId)
+      - (current.parent_id === input.parentId ? 1 : 0);
+    if (!Number.isInteger(input.position) || input.position < 0 || input.position > targetCount) {
+      throw new ConflictError("Move position is outside the sibling list");
+    }
+    if (current.parent_id === input.parentId && current.position === input.position) return;
+
+    this.closeSiblingGap(current.parent_id, current.position);
+    this.openSiblingGap(input.parentId, input.position);
+    this.db.prepare(`
+      UPDATE tasks
+      SET parent_id = ?, position = ?, updated_at = ?
+      WHERE id = ?
+    `).run(input.parentId, input.position, new Date().toISOString(), id);
+  }
+
+  private siblingCount(parentId: string | null): number {
+    const row = parentId
+      ? this.db.prepare("SELECT count(*) AS count FROM tasks WHERE parent_id = ?").get(parentId)
+      : this.db.prepare("SELECT count(*) AS count FROM tasks WHERE parent_id IS NULL").get();
+    return (row as { count: number }).count;
+  }
+
+  private closeSiblingGap(parentId: string | null, position: number): void {
+    if (parentId) {
+      this.db.prepare(`
+        UPDATE tasks SET position = position - 1
+        WHERE parent_id = ? AND position > ?
+      `).run(parentId, position);
+    } else {
+      this.db.prepare(`
+        UPDATE tasks SET position = position - 1
+        WHERE parent_id IS NULL AND position > ?
+      `).run(position);
+    }
+  }
+
+  private openSiblingGap(parentId: string | null, position: number): void {
+    if (parentId) {
+      this.db.prepare(`
+        UPDATE tasks SET position = position + 1
+        WHERE parent_id = ? AND position >= ?
+      `).run(parentId, position);
+    } else {
+      this.db.prepare(`
+        UPDATE tasks SET position = position + 1
+        WHERE parent_id IS NULL AND position >= ?
+      `).run(position);
+    }
+  }
+
   private nextPosition(parentId: string | null): number {
     const row = parentId
       ? this.db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS position FROM tasks WHERE parent_id = ?").get(parentId)
@@ -309,4 +437,8 @@ export class TaskRepository {
       WHERE NOT EXISTS (SELECT 1 FROM task_tags WHERE task_tags.tag_id = tags.id)
     `).run();
   }
+}
+
+function flattenSubtree(root: Task): Task[] {
+  return [root, ...root.children.flatMap(flattenSubtree)];
 }

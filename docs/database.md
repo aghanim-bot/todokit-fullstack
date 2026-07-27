@@ -90,7 +90,7 @@ CREATE TABLE task_tags (
 | `completed` | Non-null integer `0` or `1`, default `0`. |
 | `completed_at` | Nullable text. A table check requires it to be null exactly when `completed = 0`, and non-null exactly when `completed = 1`. Timestamp format is application-level. |
 | `flagged` | Non-null integer `0` or `1`, default `0`. |
-| `position` | Non-null nonnegative integer. It is an append position among siblings, but there is no uniqueness constraint. |
+| `position` | Non-null nonnegative zero-based position among siblings. Repository mutations keep affected sibling lists contiguous; there is no database uniqueness constraint. |
 | `created_at` | Non-null text; the repository inserts a UTC ISO timestamp. |
 | `updated_at` | Non-null text; the repository inserts and updates a UTC ISO timestamp. |
 
@@ -194,7 +194,7 @@ FROM tasks
 WHERE parent_id = ?;
 ```
 
-Root tasks use the equivalent `WHERE parent_id IS NULL`. Moving to a different parent calculates the next position in the destination. Updating without changing the parent preserves the existing position. Deletion does not compact positions, and neither the table nor repository requires them to be contiguous or unique.
+Root tasks use the equivalent `WHERE parent_id IS NULL`. Exact moves validate a destination index, decrement later source siblings, increment destination siblings at/after the insertion point, and update the moved row in one transaction. Deletion compacts the deleted root's sibling list; restoration reopens its original gap. The table has no uniqueness constraint, but repository-owned mutations maintain contiguous positions.
 
 Traversal builds a stable path segment with both position and ID:
 
@@ -202,7 +202,7 @@ Traversal builds a stable path segment with both position and ID:
 printf('%012d:%s', position, id)
 ```
 
-The zero-padded position sorts numerically for ordinary stored values, and ID breaks ties deterministically. Each descendant appends its segment with `/`. The UI exposes no drag-and-drop or other sibling-reordering operation.
+The zero-padded position sorts numerically for ordinary stored values, and ID breaks ties deterministically. Each descendant appends its segment with `/`. The UI exposes hierarchy changes through Tab/Shift+Tab rather than drag-and-drop.
 
 ## Reads and tree assembly
 
@@ -296,17 +296,19 @@ The selected task has query-relative depth `0`. If no row is returned, the repos
 
 ## Writes and transactions
 
-Create, update, and subtree deletion each run in a synchronous `better-sqlite3` transaction.
+Create, update, move, subtree deletion, and subtree restoration each run in a synchronous `better-sqlite3` transaction.
 
 Create validates the parent, allocates a sibling position, inserts one task, and replaces tag links atomically. It generates one timestamp for `created_at`, `updated_at`, and, when initially complete, `completed_at`.
 
-Update reads the current row inside the transaction, validates a changed parent, calculates completion state and the destination position, updates the task, and optionally replaces tag links. Moving and content/state changes occur atomically. `updated_at` is always replaced. Tag replacement deletes current links, inserts normalized tag names with `ON CONFLICT(name) DO NOTHING`, then inserts links using a case-insensitive name lookup.
+Update reads the current row inside the transaction, routes a changed parent through the move primitive, calculates completion state, updates the task, and optionally replaces tag links. `updated_at` is always replaced. Tag replacement deletes current links, inserts normalized tag names with `ON CONFLICT(name) DO NOTHING`, then inserts links using a case-insensitive name lookup.
+
+An exact move validates the target parent and cycle constraint before changing rows. The permitted destination position is `0..targetSiblingCount` after excluding the moved task for a same-parent move. Any validation error occurs before gap updates; any later SQL error rolls the complete transaction back.
 
 The application uses one Node process and synchronous database calls. The transaction scope protects each repository mutation on that connection, but there is no application-level coordination across multiple server processes.
 
 ## Subtree deletion
 
-Deletion first verifies the requested task exists. Within the same transaction it counts the subtree, then deletes it with the same recursive pattern:
+Deletion first reads the complete recursive subtree snapshot and verifies the requested task exists. Within the same transaction it counts the subtree, deletes it with the same recursive pattern, and compacts later siblings:
 
 ```sql
 WITH RECURSIVE subtree(id) AS (
@@ -330,9 +332,13 @@ WITH RECURSIVE subtree(id) AS (
 DELETE FROM tasks WHERE id IN (SELECT id FROM subtree);
 ```
 
-Foreign-key cascades delete task/tag links, and the trigger prunes tags that become unused. The returned count includes the selected task and all descendants.
+Foreign-key cascades delete task/tag links, and the trigger prunes tags that become unused. The returned value includes the count and the pre-delete `Task` subtree, including every field, ID, parent, position, timestamp, tag, and descendant.
 
 The explicit recursive delete is deliberate even though `parent_id` also has `ON DELETE CASCADE`: it identifies the complete target set in SQL and pairs the returned count with the same transaction.
+
+## Subtree restoration
+
+Restore accepts the server-shaped recursive snapshot returned by delete. Before inserting, it verifies the external parent, root position, unique/non-conflicting IDs, parent links, and contiguous child positions. It opens a gap at the original root position, inserts parents before descendants with their original IDs and scalar fields, and recreates tag links. Any duplicate ID or invalid descendant aborts and rolls back the gap update and every insert.
 
 ## Parent validation and cycle prevention
 
@@ -372,5 +378,5 @@ For a consistent live backup, use SQLite's backup facilities or checkpoint/backu
 - There is no authentication, owner column, tenant key, or row-level user separation.
 - There is no database-level validation for UUIDs, date strings, recurrence syntax, note length, tag characters, or maximum tags per task; those checks rely on the API path.
 - Tree depth is unbounded, full listing is unpaginated, and every list builds the complete nested tree in memory.
-- Sibling positions can contain gaps or duplicates, and there is no UI reordering.
+- Direct writes that bypass `TaskRepository` could still create duplicate positions because SQLite has no nullable-parent-aware uniqueness constraint.
 - Recurrence is stored but never schedules or generates another task.

@@ -25,6 +25,14 @@ export interface ParsedInboxInput {
   warnings: string[];
 }
 
+export type InboxHighlightKind = "title" | "date" | "recurrence" | "tag" | "warning";
+
+export interface InboxHighlightRange {
+  start: number;
+  end: number;
+  kind: InboxHighlightKind;
+}
+
 export interface ApiErrorBody {
   error: {
     code: string;

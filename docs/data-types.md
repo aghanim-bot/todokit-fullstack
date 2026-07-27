@@ -51,7 +51,7 @@ interface Task {
 | `completed` | Boolean completion state. Stored as SQLite integer `0` or `1`. |
 | `completedAt` | UTC ISO timestamp set when a task first transitions from incomplete to complete; `null` while incomplete. Re-sending `completed: true` to an already completed task preserves the prior timestamp. |
 | `flagged` | Boolean flag state. Stored as SQLite integer `0` or `1`. |
-| `position` | Zero-based append position among the task's current siblings. It is stable but not exposed as writable API input. |
+| `position` | Zero-based position among the task's current siblings. It is writable only through the exact move endpoint. |
 | `createdAt` | Server-generated UTC ISO timestamp. Immutable through the API. |
 | `updatedAt` | Server-generated UTC ISO timestamp, replaced by every repository update, including a completion update or an otherwise value-equivalent patch. |
 | `tags` | Normalized tag names, returned in case-insensitive name order. |
@@ -126,7 +126,7 @@ interface ParsedInboxInput {
 | `tags` | Tags recognized outside quotes, lowercased with the `en-US` locale and de-duplicated in encounter order. |
 | `warnings` | Zero or more parser codes. Current values are `INVALID_DATE` and `INVALID_RECURRENCE`. |
 
-Warnings make a server-side raw-text create fail with `422 PARSE_ERROR`. The browser parser uses the same return type only for a preview.
+Warnings make a server-side raw-text create/edit fail with `422 PARSE_ERROR`. `inboxHighlightRanges` returns safe, ordered, non-overlapping `{ start, end, kind }` ranges covering ordinary title text and recognized `date`, `recurrence`, `tag`, or malformed `warning` syntax. `taskToEditableRawText` serializes title, due date/time, recurrence, and sorted tags for deterministic inline editing.
 
 ## Date formats
 
@@ -222,7 +222,7 @@ The server generates `id`, sibling `position`, all audit timestamps, `completedA
 
 ## Update payload
 
-`PATCH /api/tasks/:id` accepts any nonempty subset of the create task fields except `rawText`. Unknown fields and an empty object fail with `400 VALIDATION_ERROR`.
+`PATCH /api/tasks/:id` accepts either a nonempty structured subset of task fields or one exclusive `rawText` value. Unknown fields and an empty object fail with `400 VALIDATION_ERROR`.
 
 ```json
 {
@@ -237,6 +237,29 @@ The server generates `id`, sibling `position`, all audit timestamps, `completedA
 Omitted fields preserve their current values. Explicit `null` clears `parentId`, `dueAt`, `reviewAt`, or `recurrence`; the non-nullable fields cannot be cleared with `null`. `parentId: null` moves a task to root level. A move appends it after the destination's current siblings and returns `409 CONFLICT` if the destination is the task itself or one of its descendants. `completed` is accepted on this general patch route as well as through the dedicated completion route.
 
 The current implementation checks `if (patch.tags)` before replacement. Both `[]` and nonempty arrays are truthy in JavaScript, so either replaces the links; only omission preserves them.
+
+An inline raw edit uses:
+
+```json
+{
+  "rawText": "Verify release package due 2026-08-01 every weekday #release"
+}
+```
+
+The server runs the same parser as raw creation and patches `title`, `dueAt`, `recurrence`, and `tags` together. Notes, review date, flag, completion, hierarchy, positions, and timestamps outside normal `updatedAt` behavior are preserved.
+
+## Move payload
+
+`POST /api/tasks/:id/move` requires an exact destination:
+
+```json
+{
+  "parentId": "11111111-1111-4111-8111-111111111111",
+  "position": 0
+}
+```
+
+`parentId` is a UUID or `null`; `position` is a nonnegative integer no greater than the destination sibling count after excluding the moved task. The transaction reindexes source and target siblings and rejects missing parents, cycles, and out-of-range positions without partial changes.
 
 ## Completion payload
 
@@ -277,15 +300,24 @@ Application API routes wrap their result in `data`. Create returns HTTP `201`; t
 }
 ```
 
-Delete returns a count that includes the requested task and every deleted descendant:
+Delete returns a count plus the exact pre-delete recursive snapshot:
 
 ```json
 {
   "data": {
-    "deleted": 3
+    "deleted": 3,
+    "subtree": {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "parentId": null,
+      "title": "Release checklist",
+      "position": 0,
+      "children": []
+    }
   }
 }
 ```
+
+The abbreviated `subtree` above has the full `Task` shape in a real response. `POST /api/tasks/restore` accepts `{ "subtree": <Task> }`, validates every recursive field, and returns the restored task with `201`. It preserves IDs, parent IDs, sibling positions, content/state fields, timestamps, tags, and descendants.
 
 `GET /health` is the sole exception to the success envelope:
 
