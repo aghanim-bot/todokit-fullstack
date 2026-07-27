@@ -178,6 +178,10 @@ Vitest covers parser edge cases, fresh nested-path initialization, recursive ord
 - Natural-language parsing intentionally supports a documented English subset instead of guessing at every date-like phrase.
 - Sibling ordering is stable and maintained by the API, but the UI does not yet expose drag-and-drop reordering.
 
+## Deeper documentation
+
+See the [documentation index](docs/README.md) for detailed architecture, data contract, and database references.
+
 ## License
 
 [MIT](LICENSE)
