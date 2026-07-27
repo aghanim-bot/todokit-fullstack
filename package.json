@@ -1,0 +1,52 @@
+{
+  "name": "todokit-fullstack",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"tsx watch src/server/main.ts\" \"vite --host 0.0.0.0\"",
+    "start": "node dist/server/main.js",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:client": "vite build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build": "npm run build:client && npm run build:server",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@fastify/static": "^10.1.2",
+    "better-sqlite3": "^12.2.0",
+    "chrono-node": "^2.8.0",
+    "fastify": "^5.4.0",
+    "rrule": "^2.8.1",
+    "todokit": "git+https://github.com/aghanim-bot/todokit.git#5a8944dfc777b2576142b37bd029b516d3d890e8",
+    "zod": "^4.0.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/jest-dom": "^6.6.4",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.1.0",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.0",
+    "eslint": "^10.8.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.8.0",
+    "jsdom": "^26.1.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.65.0",
+    "vite": "^7.0.6",
+    "vitest": "^3.2.4"
+  }
+}

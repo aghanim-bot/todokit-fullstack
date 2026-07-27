@@ -1,0 +1,16 @@
+services:
+  todokit:
+    build:
+      context: .
+    image: ghcr.io/aghanim-bot/todokit-fullstack:local
+    restart: unless-stopped
+    environment:
+      TODO_DB_PATH: /data/todos.sqlite
+      PORT: "3001"
+    ports:
+      - "3001:3001"
+    volumes:
+      - todo-data:/data
+
+volumes:
+  todo-data:
