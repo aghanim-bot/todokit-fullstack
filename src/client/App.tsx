@@ -7,7 +7,6 @@ import {
   type KeyboardEvent as ReactKeyboardEvent
 } from "react";
 import {
-  HighlightedInput,
   PerspectiveRail,
   ProjectNavigator,
   QuickEntry,
@@ -26,7 +25,7 @@ import {
 } from "../shared/parser";
 import type { Task } from "../shared/types";
 import { taskApi } from "./api";
-import { indentMove, outdentMove, type TreeMove } from "./tree";
+import { indentMove, outdentMove, siblingMove, type TreeMove } from "./tree";
 
 type Perspective = "inbox" | "forecast" | "flagged" | "completed";
 
@@ -64,6 +63,14 @@ function flatten(tasks: Task[]): Task[] {
   return tasks.flatMap(task => [task, ...flatten(task.children)]);
 }
 
+function renderedRowIds(tasks: Task[], expanded: Set<string>, editor: ActiveEditor | null): string[] {
+  return tasks.flatMap(task => [
+    task.id,
+    ...(expanded.has(task.id) ? renderedRowIds(task.children, expanded, editor) : []),
+    ...(expanded.has(task.id) && editor?.kind === "draft" && editor.parentId === task.id ? [DRAFT_ID] : [])
+  ]);
+}
+
 function findTask(tasks: Task[], id: string | null): Task | undefined {
   if (!id) return undefined;
   for (const task of tasks) {
@@ -77,6 +84,17 @@ function filterTree(tasks: Task[], predicate: (task: Task) => boolean): Task[] {
   return tasks.flatMap(task => {
     const children = filterTree(task.children, predicate);
     return predicate(task) || children.length ? [{ ...task, children }] : [];
+  });
+}
+
+function withEffectiveCompletion(tasks: Task[], ancestorCompleted = false): Task[] {
+  return tasks.map(task => {
+    const completed = ancestorCompleted || task.completed;
+    return {
+      ...task,
+      completed,
+      children: withEffectiveCompletion(task.children, completed)
+    };
   });
 }
 
@@ -146,7 +164,7 @@ function recurrenceLabel(rule: string | null): string {
 function isTextEditingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   return Boolean(target.closest(
-    "input, textarea, select, [contenteditable]:not([contenteditable=false]), [role=textbox]"
+    "input, textarea, select, [contenteditable]:not([contenteditable=false]), [role=textbox], [role=searchbox], [role=combobox], [role=spinbutton]"
   ));
 }
 
@@ -243,7 +261,8 @@ export function App() {
     if (!editorIdentity) return;
     const frame = requestAnimationFrame(() => {
       editorRef.current?.focus();
-      editorRef.current?.select();
+      const end = editorRef.current?.value.length ?? 0;
+      editorRef.current?.setSelectionRange(end, end);
     });
     return () => cancelAnimationFrame(frame);
   }, [editorIdentity]);
@@ -324,6 +343,19 @@ export function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key.toLocaleLowerCase("en-US") === "n"
+        && !event.ctrlKey
+        && !event.metaKey
+        && !event.altKey
+        && !event.shiftKey
+        && !event.repeat
+        && !isTextEditingTarget(event.target)
+      ) {
+        event.preventDefault();
+        document.querySelector<HTMLInputElement>('input[aria-label="Quick entry"]')?.focus();
+        return;
+      }
       if (
         event.key.toLocaleLowerCase("en-US") !== "z"
         || (!event.ctrlKey && !event.metaKey)
@@ -445,7 +477,8 @@ export function App() {
     }
   }, [cancelEditor, editor, focusSelectedRow, performMutation]);
 
-  const allTasks = useMemo(() => flatten(tasks), [tasks]);
+  const effectiveTasks = useMemo(() => withEffectiveCompletion(tasks), [tasks]);
+  const allTasks = useMemo(() => flatten(effectiveTasks), [effectiveTasks]);
   const selected = findTask(tasks, selectedId);
   const now = new Date();
   const today = now.toISOString().slice(0, 10);
@@ -464,7 +497,11 @@ export function App() {
     return !task.completed;
   }, [activeTag, perspective, today, forecastEnd]);
 
-  const visibleTasks = useMemo(() => filterTree(tasks, predicate), [tasks, predicate]);
+  const visibleTasks = useMemo(() => filterTree(effectiveTasks, predicate), [effectiveTasks, predicate]);
+  const visibleRowIds = useMemo(
+    () => renderedRowIds(visibleTasks, expanded, editor),
+    [editor, expanded, visibleTasks]
+  );
   const counts = {
     inbox: allTasks.filter(task => !task.completed).length,
     forecast: allTasks.filter(task => {
@@ -516,7 +553,12 @@ export function App() {
     patchTask(selected.id, apiPatch, "Edited task details");
   };
 
-  const moveTask = useCallback((id: string, move: TreeMove | null, restoreRowFocus = true) => {
+  const moveTask = useCallback((
+    id: string,
+    move: TreeMove | null,
+    restoreRowFocus = true,
+    label?: string
+  ) => {
     if (pendingMoves.current.has(id)) return;
     const previous = findTask(tasksRef.current, id);
     if (!previous || !move) {
@@ -527,7 +569,7 @@ export function App() {
     let inverseMove = { parentId: previous.parentId, position: previous.position };
     pendingMoves.current.add(id);
     void performMutation(
-      move.parentId === previous.parentId || move.parentId ? "Indented task" : "Outdented task",
+      label ?? (move.parentId === previous.parentId || move.parentId ? "Indented task" : "Outdented task"),
       () => {
         const current = findTask(tasksRef.current, id);
         if (!current) throw new Error("Task is no longer available to move");
@@ -545,6 +587,38 @@ export function App() {
     });
   }, [focusSelectedRow, performMutation]);
 
+  useEffect(() => {
+    const onReorderKeyDown = (event: KeyboardEvent) => {
+      if (
+        !event.altKey
+        || event.ctrlKey
+        || event.metaKey
+        || event.shiftKey
+        || event.repeat
+        || (event.key !== "ArrowUp" && event.key !== "ArrowDown")
+        || isTextEditingTarget(event.target)
+      ) return;
+      const row = event.target instanceof Element
+        ? event.target.closest<HTMLElement>('[role="treeitem"]')
+        : null;
+      if (!row || document.activeElement !== row) return;
+      const tree = row.closest('[role="tree"]');
+      const rows = tree ? [...tree.querySelectorAll<HTMLElement>('[role="treeitem"]')] : [];
+      const id = visibleRowIds[rows.indexOf(row)];
+      if (!id || id === DRAFT_ID) return;
+      event.preventDefault();
+      event.stopPropagation();
+      moveTask(
+        id,
+        siblingMove(tasksRef.current, id, event.key === "ArrowUp" ? -1 : 1),
+        true,
+        "Reordered task"
+      );
+    };
+    document.addEventListener("keydown", onReorderKeyDown, true);
+    return () => document.removeEventListener("keydown", onReorderKeyDown, true);
+  }, [moveTask, visibleRowIds]);
+
   if (loading) {
     return <main className="app-state" aria-live="polite"><span className="app-spinner"/><h1>Loading tasks</h1></main>;
   }
@@ -558,17 +632,17 @@ export function App() {
 
   const renderEditor = (viewTask: TaskViewModel) => {
     if (viewTask.id === DRAFT_ID && editor?.kind === "draft") {
-      return <HighlightedInput
+      return <input
+        type="text"
         className="app-inline-editor"
-        ariaLabel={`New subtask for ${editor.parentTitle}`}
+        aria-label={`New subtask for ${editor.parentTitle}`}
         value={editor.value}
-        highlights={inboxHighlightRanges(editor.value)}
-        onValueChange={value => setEditor(current => current?.kind === "draft" ? { ...current, value } : current)}
-        inputRef={editorRef}
+        onChange={event => setEditor(current => current?.kind === "draft" ? { ...current, value: event.target.value } : current)}
+        ref={editorRef}
         autoFocus
         autoComplete="off"
         placeholder="New subtask"
-        description="Enter saves · Escape cancels"
+        title="Enter saves · Escape cancels"
         onBlur={() => {
           if (!editor.value.trim()) cancelEditor();
         }}
@@ -586,16 +660,16 @@ export function App() {
       />;
     }
     if (editor?.kind === "existing" && editor.taskId === viewTask.id) {
-      return <HighlightedInput
+      return <input
+        type="text"
         className="app-inline-editor"
-        ariaLabel={`Edit ${viewTask.title}`}
+        aria-label={`Edit ${viewTask.title}`}
         value={editor.value}
-        highlights={inboxHighlightRanges(editor.value)}
-        onValueChange={value => setEditor(current => current?.kind === "existing" ? { ...current, value } : current)}
-        inputRef={editorRef}
+        onChange={event => setEditor(current => current?.kind === "existing" ? { ...current, value: event.target.value } : current)}
+        ref={editorRef}
         autoFocus
         autoComplete="off"
-        description="Enter saves · Shift+Enter saves and adds subtask · Escape cancels · Tab changes level"
+        title="Enter saves · Shift+Enter saves and adds subtask · Escape cancels · Tab changes level"
         onKeyDown={event => {
           if (event.key === "Escape") {
             event.preventDefault();
@@ -613,10 +687,11 @@ export function App() {
   };
 
   const handleTaskKeyDown = (viewTask: TaskViewModel, event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (viewTask.id === DRAFT_ID || event.key !== "Tab") return;
+    if (viewTask.id === DRAFT_ID) return;
     const target = event.target;
     const fromRow = target === event.currentTarget;
     const fromEditor = target instanceof Element && Boolean(target.closest(".app-inline-editor"));
+    if (event.key !== "Tab") return;
     if (!fromRow && !fromEditor) return;
     event.preventDefault();
     const move = event.shiftKey
@@ -670,7 +745,7 @@ export function App() {
           quickSavePending.current = true;
           void performMutation(
             "Created task",
-            () => taskApi.create({ rawText }),
+            () => taskApi.create({ rawText, parentId: null }),
             task => () => taskApi.delete(task.id)
           ).then(created => {
             if (created) setQuickText("");
@@ -698,7 +773,7 @@ export function App() {
         <span role="status" aria-live="polite">{status}</span>
         <details>
           <summary>Keyboard shortcuts</summary>
-          <span>↑/↓ navigate · ←/→ collapse or expand · Enter edit/save · Shift+Enter save + subtask · Tab/Shift+Tab indent/outdent · Escape cancel · Ctrl/Cmd+Z undo</span>
+          <span>N new root task · ↑/↓ navigate · Alt+↑/↓ reorder · ←/→ collapse or expand · Enter edit/save · Shift+Enter save + subtask · Tab/Shift+Tab indent/outdent · Escape cancel · Ctrl/Cmd+Z undo</span>
         </details>
       </div>
       <TaskOutline

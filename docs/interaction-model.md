@@ -25,14 +25,21 @@ When focus is on a task row:
 | `Enter` / `Space` | Select the row. In this application, selection opens the existing-task editor. |
 | `Tab` | Indent beneath the previous visible sibling, when one exists. |
 | `Shift+Tab` | Outdent one level and place the task after its former parent. |
+| `Alt+ArrowUp` / `Alt+ArrowDown` | Move the focused row before or after its full structural sibling. |
 
 Todokit owns the six arrow/Home/End navigation keys. `App` handles Tab through `onTaskKeyDown`. Tab is intercepted only when the event originates from the row itself or its inline editor; quick entry, inspector controls, row buttons, and other nested controls retain native Tab behavior.
 
 Indentation is derived from the currently filtered tree. An indent appends the task after all children of the chosen full-tree parent, including children hidden by the current filter. The exact move API still validates parent, cycle, and position invariants. A task without a previous sibling cannot indent, and a root cannot outdent.
 
+Sibling reordering is derived from the complete unfiltered tree, so completed or otherwise hidden siblings still occupy their persisted positions. Boundary moves are rejected without an API call. Inline editors keep native `Alt+Arrow` behavior; reordering applies only while the row itself has focus. Successful moves refresh from the server and undo to the exact parent and position captured when the queued move begins.
+
+## Effective completion
+
+A completed task makes every descendant effectively completed for perspectives and counts without changing any descendant's stored `completed` value. Active inbox, forecast, flagged, and tag views therefore exclude the whole subtree. The completed perspective includes the coherent subtree and its effective count. Reopening the ancestor reveals descendants in their independently persisted states.
+
 ## Existing-task editing
 
-Clicking a task's noninteractive row content or selecting it with Enter/Space opens a `HighlightedInput` in the row title slot. The editor starts with `taskToEditableRawText(task)`, a deterministic representation of the title, due value, recurrence, and sorted tags. Notes, review date, flag, completion, hierarchy, and timestamps are not represented in this text editor.
+Clicking a task's noninteractive row content or selecting it with Enter/Space opens a normal, unhighlighted native input in the row title slot. The editor starts with `taskToEditableRawText(task)`, a deterministic representation of the title, due value, recurrence, and sorted tags. Focus places a collapsed caret at the end instead of selecting the value. Notes, review date, flag, completion, hierarchy, and timestamps are not represented in this text editor.
 
 The shared parser runs on every value change and provides `title`, `date`, `recurrence`, `tag`, and `warning` ranges. The client does not submit empty text, an empty parsed title, or parser warnings.
 
@@ -62,7 +69,7 @@ After successful creation, the server task is selected and row focus is restored
 
 ## Highlighting and composition
 
-Quick entry and both inline editor forms derive ranges with `inboxHighlightRanges`. Todokit's `HighlightedInput` keeps a real native input above a pointer-inert, `aria-hidden` React-rendered backdrop. No input content is passed to `innerHTML`.
+Quick Entry alone derives ranges with `inboxHighlightRanges`. Todokit's `HighlightedInput` keeps its real native input above a pointer-inert, `aria-hidden` React-rendered backdrop. Inline existing-task and draft editors have no highlight backdrop or mark overlay.
 
 Enter does not submit an inline editor while the native event reports IME composition. Native caret, selection, and composition behavior therefore remains with the input. Quick entry uses its ordinary form submission path.
 
@@ -86,13 +93,15 @@ The client keeps at most 100 successful mutation inverses in memory. Undo is LIF
 
 Native text undo takes precedence for inputs, textareas, selects, content-editable elements, and textbox/searchbox/combobox/spinbutton roles. Modified shortcuts using Shift or Alt and repeated keydown events are not treated as application undo.
 
+The unmodified `n` key focuses Quick Entry outside text-editing targets. Repeats and every modifier combination are ignored. Quick Entry always submits `{ rawText, parentId: null }`, so this global creation path cannot inherit a selected task as its parent.
+
 | Forward action | Stored inverse |
 | --- | --- |
 | Create root or child | Delete the returned task ID. |
 | Inline raw edit | Patch the previous title, due date, recurrence, and tags. |
 | Inspector edit | Patch exactly the fields changed, using their previous values. |
 | Complete or reopen | Restore the previous completion boolean. |
-| Indent or outdent | Move to the parent and sibling position observed when the queued move actually begins. |
+| Indent, outdent, or sibling reorder | Move to the parent and sibling position observed when the queued move actually begins. |
 | Recursive delete | Restore the exact subtree snapshot returned by delete. |
 
 Execution-time move capture is important: queued moves can change positions before a later move begins. Recursive restore preserves IDs, hierarchy, sibling positions, fields, timestamps, tags, and descendants transactionally.

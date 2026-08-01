@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Task } from "../shared/types";
-import { indentMove, outdentMove, previousSibling } from "./tree";
+import { indentMove, outdentMove, previousSibling, siblingMove } from "./tree";
 
 function task(id: string, children: Task[] = []): Task {
   return {
@@ -57,5 +57,28 @@ describe("outline move helpers", () => {
     expect(outdentMove(tasks, "first")).toBeNull();
     expect(outdentMove(tasks, "child")).toEqual({ parentId: null, position: 1 });
     expect(outdentMove(tasks, "grandchild")).toEqual({ parentId: "first", position: 1 });
+  });
+
+  it("moves among the full sibling list and rejects sibling boundaries", () => {
+    const hidden = task("hidden");
+    hidden.completed = true;
+    hidden.position = 1;
+    const first = task("first");
+    const last = task("last");
+    last.position = 2;
+    const childFirst = task("child-first");
+    const childLast = task("child-last");
+    childFirst.parentId = "first";
+    childLast.parentId = "first";
+    childLast.position = 1;
+    first.children = [childFirst, childLast];
+    const tasks = [first, hidden, last];
+
+    expect(siblingMove(tasks, "first", -1)).toBeNull();
+    expect(siblingMove(tasks, "first", 1)).toEqual({ parentId: null, position: 1 });
+    expect(siblingMove(tasks, "last", -1)).toEqual({ parentId: null, position: 1 });
+    expect(siblingMove(tasks, "last", 1)).toBeNull();
+    expect(siblingMove(tasks, "child-last", -1)).toEqual({ parentId: "first", position: 0 });
+    expect(siblingMove(tasks, "child-first", 1)).toEqual({ parentId: "first", position: 1 });
   });
 });

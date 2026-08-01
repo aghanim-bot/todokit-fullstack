@@ -73,11 +73,13 @@ Supported natural recurrence syntax is `daily`, `weekly`, `monthly`, `yearly`, `
 
 Tags begin with `#` at the start of a token and contain letters, numbers, underscores, or hyphens. They are case-normalized and de-duplicated. Hashes inside single or double quotes, embedded hashes such as `C#`, and email-like text are left alone. Invalid explicit dates or `every …` expressions are not silently removed: the API returns `422 PARSE_ERROR`, while the client preview warns before submission. This constrained recognition avoids treating ordinary words such as “May” or “Friday team” as accidental dates.
 
-Quick entry and inline row editors use Todokit's native-input highlighting backdrop. The shared parser supplies exact, non-overlapping `title`, `date`, `recurrence`, `tag`, and `warning` source ranges; rendering uses React text nodes rather than HTML injection.
+Quick Entry uses Todokit's native-input highlighting backdrop. The shared parser supplies exact, non-overlapping `title`, `date`, `recurrence`, `tag`, and `warning` source ranges; rendering uses React text nodes rather than HTML injection. Inline row editors are ordinary unhighlighted inputs with a collapsed caret.
 
 ## Keyboard workflow
 
+- `N`: focus Quick Entry to create a root task when focus is not in a text-editing control.
 - `Arrow Up` / `Arrow Down`, `Home` / `End`: move through visible tasks.
+- `Alt+Arrow Up` / `Alt+Arrow Down`: persistently reorder the focused task among all structural siblings.
 - `Arrow Right` / `Arrow Left`: expand/collapse or move to a child/parent.
 - `Enter` or click a task title: select it and edit in place; `Enter` again saves.
 - `Shift+Enter`: save an existing task and open a new inline subtask draft.
