@@ -46,3 +46,11 @@ export function outdentMove(tasks: Task[], id: string): TreeMove | null {
     position: location.parent.position + 1
   };
 }
+
+export function siblingMove(tasks: Task[], id: string, direction: -1 | 1): TreeMove | null {
+  const location = findLocation(tasks, id);
+  if (!location) return null;
+  const position = location.index + direction;
+  if (position < 0 || position >= location.siblings.length) return null;
+  return { parentId: location.task.parentId, position };
+}

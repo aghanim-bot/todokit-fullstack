@@ -224,9 +224,10 @@ describe("App", () => {
       "Existing task due 2026-08-01 at 5:30pm RRULE:FREQ=DAILY #urgent #work"
     );
     await waitFor(() => {
-      expect(editor.selectionStart).toBe(0);
+      expect(editor.selectionStart).toBe(editor.value.length);
       expect(editor.selectionEnd).toBe(editor.value.length);
     });
+    expect(editor.closest(".app-inline-editor")?.querySelector("mark")).not.toBeInTheDocument();
 
     await user.clear(editor);
     await user.type(editor, "Changed tomorrow every weekday #Home{Enter}");
@@ -259,6 +260,68 @@ describe("App", () => {
         })
       })
     );
+  });
+
+  it("uses n outside editing controls to focus Quick Entry and always creates a root task", async () => {
+    const user = userEvent.setup();
+    render(<App/>);
+    await screen.findByText("Existing task");
+    const quick = screen.getByRole("textbox", { name: "Quick entry" });
+
+    fireEvent.keyDown(document.body, { key: "n" });
+    expect(quick).toHaveFocus();
+    await user.type(quick, "Root from shortcut{Enter}");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/tasks", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ rawText: "Root from shortcut", parentId: null })
+    })));
+
+    const existing = within(screen.getByRole("tree")).getByText("Existing task");
+    (existing.closest("[role=treeitem]") as HTMLElement).focus();
+    fireEvent.keyDown(existing, { key: "n", altKey: true });
+    expect(quick).not.toHaveFocus();
+    const editor = document.createElement("input");
+    document.body.append(editor);
+    editor.focus();
+    fireEvent.keyDown(editor, { key: "n" });
+    expect(quick).not.toHaveFocus();
+    editor.remove();
+    const combobox = document.createElement("div");
+    combobox.setAttribute("role", "combobox");
+    combobox.tabIndex = 0;
+    document.body.append(combobox);
+    combobox.focus();
+    fireEvent.keyDown(combobox, { key: "n" });
+    expect(quick).not.toHaveFocus();
+    fireEvent.keyDown(document.body, { key: "n", repeat: true });
+    expect(quick).not.toHaveFocus();
+    combobox.remove();
+    expect(screen.getByText(/n new root task/i)).toBeInTheDocument();
+  });
+
+  it("hides incomplete descendants of completed ancestors from active views and counts", async () => {
+    const child = task({
+      id: childId,
+      parentId: rootId,
+      title: "Incomplete child",
+      depth: 1,
+      tags: ["child"],
+      flagged: true,
+      dueAt: "2026-08-02T00:00:00.000Z"
+    });
+    tasks = [task({ title: "Completed parent", completed: true, completedAt: "2026-07-27T01:00:00.000Z", children: [child] })];
+    render(<App/>);
+
+    await screen.findByText("All clear");
+    const perspectives = screen.getByRole("complementary", { name: "Perspectives" });
+    expect(within(perspectives).getByText("Inbox").closest("button")?.querySelector(".tk-count")).toBeNull();
+    expect(within(perspectives).getByText("Flagged").closest("button")?.querySelector(".tk-count")).toBeNull();
+    expect(screen.queryByText("Incomplete child")).not.toBeInTheDocument();
+
+    fireEvent.click(within(perspectives).getByText("Completed"));
+    expect(await screen.findByText("Completed parent")).toBeVisible();
+    expect(screen.getByText("Incomplete child")).toBeVisible();
+    expect(within(perspectives).getByText("Completed").closest("button")).toHaveTextContent("2");
   });
 
   it("cancels editing with Escape, restores row focus, and rejects an empty existing edit", async () => {
@@ -374,6 +437,86 @@ describe("App", () => {
     const add = screen.getByRole("button", { name: "Add subtask to First" });
     fireEvent.keyDown(add, { key: "Tab" });
     expect(moveCalls()).toBe(beforeNativeTabs);
+  });
+
+  it("reorders root and nested siblings with Alt+Arrow keys, persists refresh order, and undoes exactly", async () => {
+    const child = task({ id: childId, parentId: rootId, title: "Child first", depth: 1, tags: [], position: 0 });
+    const nestedSecond = task({ id: createdId, parentId: rootId, title: "Child second", depth: 1, tags: [], position: 1 });
+    tasks = [
+      task({ title: "First", children: [child, nestedSecond] }),
+      task({ id: secondId, title: "Hidden completed", completed: true, completedAt: "2026-07-27T01:00:00.000Z", tags: [], position: 1 }),
+      task({ id: "55555555-5555-4555-8555-555555555555", title: "Last", tags: [], position: 2 })
+    ];
+    render(<App/>);
+    const tree = await screen.findByRole("tree");
+    const lastRow = within(tree).getByText("Last").closest("[role=treeitem]") as HTMLElement;
+    lastRow.focus();
+    fireEvent.keyDown(lastRow, { key: "ArrowUp", altKey: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/55555555-5555-4555-8555-555555555555/move",
+      expect.objectContaining({ body: JSON.stringify({ parentId: null, position: 1 }) })
+    ));
+    await waitFor(() => expect(tasks.map(item => item.id)).toEqual([rootId, "55555555-5555-4555-8555-555555555555", secondId]));
+    await waitFor(() => expect(within(screen.getByRole("tree")).getByText("Last").closest("[role=treeitem]")).toHaveFocus());
+
+    const childSecondRow = within(screen.getByRole("tree")).getByText("Child second").closest("[role=treeitem]") as HTMLElement;
+    childSecondRow.focus();
+    fireEvent.keyDown(childSecondRow, { key: "ArrowUp", altKey: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/tasks/${createdId}/move`,
+      expect.objectContaining({ body: JSON.stringify({ parentId: rootId, position: 0 }) })
+    ));
+    await waitFor(() => expect(find(tasks, rootId)?.children.map(item => item.id)).toEqual([createdId, childId]));
+    fireEvent.click(screen.getByRole("button", { name: "Undo last action" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/tasks/${createdId}/move`,
+      expect.objectContaining({ body: JSON.stringify({ parentId: rootId, position: 1 }) })
+    ));
+    await waitFor(() => expect(find(tasks, rootId)?.children.map(item => item.id)).toEqual([childId, createdId]));
+
+    const calls = fetchMock.mock.calls.filter(([url]) => String(url).includes("/move")).length;
+    const firstRow = within(screen.getByRole("tree")).getByText("First").closest("[role=treeitem]") as HTMLElement;
+    firstRow.focus();
+    fireEvent.keyDown(firstRow, { key: "ArrowUp", altKey: true });
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/move"))).toHaveLength(calls);
+    expect(document.querySelector(".app-commands [role=status]")).toHaveTextContent(/not available/i);
+  });
+
+  it("keeps Alt+Arrow native inside inline editors and renders drafts without a highlight overlay", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App/>);
+    await user.click(await screen.findByText("Existing task"));
+    const existing = screen.getByRole("textbox", { name: "Edit Existing task" });
+    const before = fetchMock.mock.calls.filter(([url]) => String(url).includes("/move")).length;
+    fireEvent.keyDown(existing, { key: "ArrowUp", altKey: true });
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/move"))).toHaveLength(before);
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Add subtask to Existing task" }));
+    const draft = screen.getByRole("textbox", { name: "New subtask for Existing task" }) as HTMLInputElement;
+    await user.type(draft, "Draft tomorrow #tag");
+    expect(container.querySelectorAll(".app-inline-editor mark")).toHaveLength(0);
+    expect(draft.selectionStart).toBe(draft.value.length);
+    expect(draft.selectionEnd).toBe(draft.value.length);
+  });
+
+  it("reorders the focused task by identity when an earlier inline draft adds a tree row", async () => {
+    tasks = [
+      task({ title: "First" }),
+      task({ id: secondId, title: "Second", tags: [], position: 1 })
+    ];
+    const user = userEvent.setup();
+    render(<App/>);
+    await user.click(await screen.findByRole("button", { name: "Add subtask to First" }));
+    await user.type(screen.getByRole("textbox", { name: "New subtask for First" }), "Unsaved draft");
+
+    const secondRow = within(screen.getByRole("tree")).getByText("Second").closest("[role=treeitem]") as HTMLElement;
+    secondRow.focus();
+    fireEvent.keyDown(secondRow, { key: "ArrowUp", altKey: true });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      `/api/tasks/${secondId}/move`,
+      expect.objectContaining({ body: JSON.stringify({ parentId: null, position: 0 }) })
+    ));
   });
 
   it("uses execution-time positions for exact LIFO undo after queued sibling moves", async () => {
